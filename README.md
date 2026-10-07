@@ -4,6 +4,8 @@ An open-source, self-hostable credit-risk decision-support demo. Applicants can 
 
 The app is intentionally presented as a **demonstration**, not a lender-ready underwriting system. Its model uses a small, single-month LendingClub sample and must not be the sole basis for a lending decision.
 
+For a plain-language explanation of the application flow, backend, storage, model, and project files, see the [project guide](docs/PROJECT_GUIDE.md).
+
 ## What works
 
 - Applicant registration, sign-in, private application history, and requested-information resubmission.
