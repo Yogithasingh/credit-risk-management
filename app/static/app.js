@@ -107,7 +107,7 @@ function showRegister() {
 }
 function rolePages() {
   if (state.user.role === 'APPLICANT') return [
-    ['dashboard', 'Overview', '◫'], ['applications', 'My applications', '▤'], ['new-application', 'New application', '+'],
+    ['dashboard', 'Overview', '◫'], ['applications', 'My applications', '▤'], ['notifications', 'Notifications', '♧'], ['new-application', 'New application', '+'],
   ];
   const pages = [['dashboard', 'Overview', '◫'], ['applications', 'Applications', '▤'], ['model', 'Model & governance', '⌁']];
   if (state.user.role === 'ADMIN') pages.push(['users', 'User access', '♙'], ['policy', 'Risk settings', '⚙'], ['audit', 'Audit history', '◷']);
@@ -122,8 +122,9 @@ function showWorkspace() {
   byId('topbar-date').textContent = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date());
   refreshHealth();
   const pages = rolePages();
-  byId('main-nav').innerHTML = pages.map(([key, label, icon]) => `<button class="nav-item ${state.page === key ? 'active' : ''}" type="button" data-action="nav" data-page="${key}"><span class="nav-icon">${icon}</span><span>${label}</span></button>`).join('');
+  byId('main-nav').innerHTML = pages.map(([key, label, icon]) => `<button class="nav-item ${state.page === key ? 'active' : ''}" type="button" data-action="nav" data-page="${key}"><span class="nav-icon">${icon}</span><span class="nav-label">${label}</span>${key === 'notifications' ? '<span id="notification-count" class="notification-count hidden" aria-label="Unread notifications"></span>' : ''}</button>`).join('');
   if (!pages.some(([key]) => key === state.page)) state.page = 'dashboard';
+  refreshNotificationBadge();
   renderPage();
 }
 async function refreshHealth() {
@@ -138,7 +139,7 @@ async function refreshHealth() {
 }
 function setPageHeader() {
   const pages = Object.fromEntries(rolePages().map(([key, title]) => [key, title]));
-  const title = pages[state.page] || (state.page === 'application-detail' ? 'Application review' : 'Credit risk workspace');
+  const title = pages[state.page] || (state.page === 'application-detail' ? (state.user.role === 'APPLICANT' ? 'Application status' : 'Application review') : 'Credit risk workspace');
   byId('page-title').textContent = title;
   byId('page-kicker').textContent = state.user.role === 'APPLICANT' ? 'APPLICANT PORTAL' : state.user.role === 'ADMIN' ? 'RISK OPERATIONS' : 'CREDIT RISK PLATFORM';
   byId('main-nav').querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.page === state.page));
@@ -154,12 +155,14 @@ function navigate(page, data = {}) {
 }
 async function renderPage() {
   if (!state.user) return;
+  if (state.user.role === 'APPLICANT') refreshNotificationBadge();
   setPageHeader();
   clearNotice();
   byId('page').innerHTML = `<div class="loading"><span class="spinner"></span>Loading your workspace…</div>`;
   try {
     if (state.page === 'dashboard') await renderDashboard();
     else if (state.page === 'applications') await renderApplications();
+    else if (state.page === 'notifications' && state.user.role === 'APPLICANT') await renderNotifications();
     else if (state.page === 'new-application') renderApplicationForm();
     else if (state.page === 'application-detail') await renderApplicationDetail(state.applicationId);
     else if (state.page === 'model') await renderModel();
@@ -193,7 +196,7 @@ function monthChart(items = []) {
 function applicationRows(items, staff = false) {
   if (!items.length) return `<tr><td colspan="7"><div class="empty-state"><strong>No applications yet</strong>${staff ? 'Submitted applications will appear in this queue.' : 'Start an application when you are ready.'}</div></td></tr>`;
   return items.map((item) => `<tr data-action="open-app" data-id="${escapeHtml(item.id)}">
-    <td><span class="table-primary">${escapeHtml(item.applicant_name || 'Applicant')}</span><span class="table-secondary">${escapeHtml(item.id.slice(0, 8).toUpperCase())} · ${dateText(item.created_at)}</span></td>
+    <td><span class="table-primary">${escapeHtml(item.applicant_name || 'Applicant')}</span><span class="table-secondary">${escapeHtml(item.id.slice(0, 8).toUpperCase())} · Submitted ${dateText(item.created_at)}</span><span class="table-secondary">Status updated ${dateText(item.status_updated_at)}</span></td>
     <td>${staff ? escapeHtml(item.applicant_email || '') : `${number(item.application_data.term_months)} months`}</td>
     <td>${money(item.application_data.loan_amount)}</td>
     <td>${item.prediction ? percent(item.prediction.probability_of_default) : '—'}</td>
@@ -310,10 +313,15 @@ function detailFields(data) {
 function timelineHtml(events = []) {
   if (!events.length) return '<div class="empty-inline">No activity recorded yet.</div>';
   const labels = {
-    APPLICATION_SUBMITTED: 'Application submitted', PREDICTION_GENERATED: 'Risk assessment generated', APPLICATION_REASSESSED: 'New risk assessment generated', ANALYST_REVIEW_STARTED: 'Analyst review started',
-    ANALYST_DECISION_RECORDED: 'Analyst decision recorded', ANALYST_APPLICATION_VIEWED: 'Application reviewed by credit team', APPLICANT_INFORMATION_RESUBMITTED: 'Requested information resubmitted',
+    APPLICATION_SUBMITTED: 'Application submitted', PREDICTION_GENERATED: 'Risk assessment generated', APPLICATION_REASSESSED: 'New risk assessment generated', ANALYST_REVIEW_STARTED: 'Administrator review started',
+    APPLICANT_INFORMATION_RESUBMITTED: 'Requested information resubmitted',
   };
-  return `<div class="timeline">${events.map((event) => `<div class="timeline-item"><strong>${escapeHtml(labels[event.action] || titleWords(event.action))}${event.actor ? ` · ${escapeHtml(event.actor)}` : ''}</strong><small>${dateText(event.created_at, true)}</small>${event.details?.notes ? `<small>${escapeHtml(event.details.notes)}</small>` : ''}</div>`).join('')}</div>`;
+  return `<div class="timeline">${events.map((event) => {
+    const decision = event.action === 'ANALYST_DECISION_RECORDED' ? event.details?.decision : '';
+    const decisionLabels = { APPROVED: 'Approval recorded', REJECTED: 'Rejection recorded', NEEDS_MORE_INFORMATION: 'More information requested' };
+    const label = decisionLabels[decision] || labels[event.action] || titleWords(event.action);
+    return `<div class="timeline-item"><strong>${escapeHtml(label)}${event.actor ? ` · ${escapeHtml(event.actor)}` : ''}</strong><small>${dateText(event.created_at, true)}</small>${event.details?.notes ? `<small>${escapeHtml(event.details.notes)}</small>` : ''}</div>`;
+  }).join('')}</div>`;
 }
 async function renderApplicationDetail(id) {
   const item = await api(`/api/applications/${encodeURIComponent(id)}`);
@@ -322,7 +330,7 @@ async function renderApplicationDetail(id) {
   const risk = prediction?.risk_category || '';
   const warningBlock = prediction?.range_warnings?.length ? `<div class="callout warning" style="margin-top:12px"><strong>Outside training range.</strong> ${prediction.range_warnings.map((warning) => `${escapeHtml(warning.label)} ${escapeHtml(number(warning.submitted_value, 1))} is outside ${escapeHtml(number(warning.observed_minimum, 1))}–${escapeHtml(number(warning.observed_maximum, 1))}. Treat this estimate cautiously.`).join('<br>')}</div>` : '';
   const applicantResponse = !staff && item.status === 'NEEDS_MORE_INFORMATION';
-  const canReassess = staff && ['AI_ASSESSED', 'UNDER_REVIEW', 'NEEDS_MORE_INFORMATION'].includes(item.status);
+  const canReassess = staff && ['AI_ASSESSED', 'UNDER_REVIEW'].includes(item.status);
   const reassessButton = canReassess ? `<button type="button" class="button button-outline" data-action="reassess" data-id="${escapeHtml(item.id)}">New assessment</button>` : '';
   const actions = staff ? `${reassessButton}${item.status === 'AI_ASSESSED'
     ? `<button type="button" class="button button-primary" data-action="start-review" data-id="${escapeHtml(item.id)}">Start analyst review</button>`
@@ -334,10 +342,11 @@ async function renderApplicationDetail(id) {
   const ownerCard = `<section class="panel"><div class="panel-head"><div><div class="panel-title">Applicant &amp; loan profile</div><div class="panel-subtitle">${staff ? `${escapeHtml(item.applicant_name)} · ${escapeHtml(item.applicant_email || '')}` : 'Your submitted details'}</div></div></div><div class="panel-body">${detailFields(item.application_data)}</div></section>`;
   const bands = prediction?.thresholds ? `LOW ≤ ${number(prediction.thresholds.low_risk_maximum * 100,0)}% · MEDIUM ≤ ${number(prediction.thresholds.medium_risk_maximum * 100,0)}%` : 'Risk thresholds unavailable';
   const assessment = prediction ? `<section class="assessment-card ${escapeHtml(risk.toLowerCase())}"><div><div class="assessment-label">RISK CATEGORY</div><div class="assessment-category ${escapeHtml(risk.toLowerCase())}">${escapeHtml(risk)} RISK</div><div class="assessment-caption">${escapeHtml(bands)}</div></div><div class="risk-score-block"><div class="assessment-label">PROBABILITY OF DEFAULT</div><div class="assessment-value">${percent(prediction.probability_of_default)}</div><div class="assessment-meter"><span style="width:${Math.max(0,Math.min(100,prediction.risk_score))}%"></span></div></div><div><div class="assessment-label">RISK SCORE</div><div class="assessment-value">${number(prediction.risk_score,1)} <span class="assessment-caption">/ 100</span></div><div class="assessment-caption">${escapeHtml(prediction.model_version)} · ${escapeHtml(item.prediction ? dateText(prediction.created_at) : '')}</div></div></section>` : '<div class="callout warning">No assessment is available for this application yet.</div>';
+  const applicantStatus = !staff && item.applicant_status ? `<section class="panel applicant-status-panel"><div class="panel-head"><div><div class="panel-title">Application status</div><div class="panel-subtitle">Your application record from the credit team</div></div>${statusBadge(item.status)}</div><div class="panel-body"><p class="status-explanation">${escapeHtml(item.applicant_status.summary)}</p><div class="status-next-step"><strong>Next step</strong><p>${escapeHtml(item.applicant_status.next_action)}</p></div><div class="field-hint" style="margin-top:12px">Submitted ${dateText(item.created_at, true)} · Last status update ${dateText(item.status_updated_at, true)}</div></div></section>` : '';
   const history = (item.prediction_history || []).length > 1 ? `<section class="panel"><div class="panel-head"><div><div class="panel-title">Prediction history</div><div class="panel-subtitle">Each assessment is retained with its model version and risk bands</div></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Date</th><th>Model version</th><th>Probability</th><th>Risk bands</th><th>Risk</th></tr></thead><tbody>${item.prediction_history.map((entry)=>`<tr><td>${dateText(entry.created_at,true)}</td><td>${escapeHtml(entry.model_version)}</td><td>${percent(entry.probability_of_default)}</td><td>${entry.thresholds ? `≤${number(entry.thresholds.low_risk_maximum*100,0)}% / ≤${number(entry.thresholds.medium_risk_maximum*100,0)}%` : 'Unknown'}</td><td>${riskBadge(entry.risk_category)}</td></tr>`).join('')}</tbody></table></div></section>` : '';
   const timeline = item.timeline ? `<section class="panel"><div class="panel-head"><div><div class="panel-title">Application history</div><div class="panel-subtitle">Recorded actions</div></div></div><div class="panel-body">${timelineHtml(item.timeline)}</div></section>` : '';
   byId('page').innerHTML = `<div class="detail-header"><div><button class="text-button" data-action="nav" data-page="applications">← Back to applications</button><div class="detail-id" style="margin-top:9px">Application ${escapeHtml(item.id.slice(0, 8).toUpperCase())}</div><div class="detail-meta">Submitted ${dateText(item.created_at, true)} · ${statusBadge(item.status)}${item.decision ? ` · Decision: ${escapeHtml(statusLabel(item.decision))}` : ''}</div></div><div class="detail-actions"><a class="button button-outline" href="/api/reports/applications/${encodeURIComponent(item.id)}.pdf">Download PDF</a>${actions}</div></div>
-    ${assessment}${warningBlock}
+    ${applicantStatus}${assessment}${warningBlock}
     <div class="detail-grid" style="margin-top:15px"><div style="display:grid;gap:15px">${ownerCard}${factorsBlock}${notePanel}</div><div style="display:grid;align-content:start;gap:15px"><section class="panel"><div class="panel-head"><div><div class="panel-title">Human review</div><div class="panel-subtitle">Final outcome remains with authorized staff</div></div></div><div class="panel-body">${item.decision ? `<div class="detail-field"><small>Recorded decision</small><strong>${escapeHtml(statusLabel(item.decision))}</strong></div><div class="detail-field" style="margin-top:13px"><small>Decision date</small><strong>${dateText(item.decision_at, true)}</strong></div>` : `<div class="callout">${staff ? 'Review the application details, consider the risk estimate, and record your own decision.' : 'The risk estimate supports a human review. It does not automatically approve or reject an application.'}</div>`}</div></section>${history}${timeline}</div></div>
     <div class="callout important" style="margin-top:15px">${staff ? 'Model explanations describe association with the estimated probability, not cause. A high-risk estimate must not be used as an automatic rejection.' : 'This assessment is generated by a machine-learning model and supports—not replaces—human credit decisions.'}</div>`;
 }
@@ -382,6 +391,41 @@ async function renderAudit() {
   const result = await api(`/api/audit?page=${state.auditPage}&page_size=50`);
   const pages = Math.max(1, Math.ceil(result.total / result.page_size));
   byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">IMMUTABLE HISTORY</div><h2>Audit history</h2><p>Sign-ins, access changes, predictions, reviews, decisions, and policy changes.</p></div></div><section class="panel"><div class="panel-head"><div><div class="panel-title">${number(result.total)} audit events</div><div class="panel-subtitle">Newest first · 50 records per page</div></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Resource</th><th>Details</th></tr></thead><tbody>${result.items.map((item)=>`<tr><td>${dateText(item.created_at,true)}</td><td>${escapeHtml(item.actor_email || 'System')}<span class="table-secondary">${escapeHtml(item.actor_role || '')}</span></td><td><span class="role-badge">${escapeHtml(titleWords(item.action))}</span></td><td>${escapeHtml(item.resource_type)} ${escapeHtml((item.resource_id||'').slice(0,8))}</td><td><span class="audit-detail">${escapeHtml(JSON.stringify(item.details))}</span></td></tr>`).join('') || '<tr><td colspan="5" class="empty-inline">No events recorded.</td></tr>'}</tbody></table></div><div class="table-pagination"><span>Page ${result.page} of ${pages}</span><div class="pagination-actions"><button class="button button-outline button-small" data-action="audit-page" data-page-number="${Math.max(1,result.page-1)}" ${result.page<=1?'disabled':''}>Previous</button><button class="button button-outline button-small" data-action="audit-page" data-page-number="${Math.min(pages,result.page+1)}" ${result.page>=pages?'disabled':''}>Next</button></div></div></section>`;
+}
+
+async function refreshNotificationBadge() {
+  const badge = byId('notification-count');
+  const userId = state.user?.id;
+  if (!badge || !userId || state.user?.role !== 'APPLICANT') return;
+  try {
+    const result = await api('/api/notifications?page=1&page_size=1');
+    if (state.user?.id !== userId) return;
+    const count = Number(result.unread_count || 0);
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.classList.toggle('hidden', count === 0);
+    badge.setAttribute('aria-label', `${count} unread notification${count === 1 ? '' : 's'}`);
+  } catch {
+    badge.classList.add('hidden');
+  }
+}
+
+async function renderNotifications() {
+  const result = await api('/api/notifications?page=1&page_size=50');
+  const labels = {
+    APPLICATION_APPROVED: 'Application approved',
+    APPLICATION_REJECTED: 'Application decision recorded',
+    APPLICATION_INFORMATION_REQUESTED: 'Information requested',
+  };
+  const cards = result.items.map((item) => `<article class="notification-card ${item.is_read ? '' : 'unread'}">
+      <div class="notification-copy"><div class="notification-title">${escapeHtml(labels[item.notification_type] || 'Application update')}${item.is_read ? '' : '<span class="notification-unread-label">New</span>'}</div>
+      <p>${escapeHtml(item.message)}</p><small>Application ${escapeHtml(item.application_id.slice(0, 8).toUpperCase())} · ${dateText(item.created_at, true)}</small></div>
+      <div class="notification-actions"><button type="button" class="button button-outline button-small" data-action="open-notification" data-id="${escapeHtml(item.id)}" data-application-id="${escapeHtml(item.application_id)}" data-is-read="${item.is_read}">Open application</button>
+      ${item.is_read ? '' : `<button type="button" class="text-button" data-action="mark-notification-read" data-id="${escapeHtml(item.id)}">Mark read</button>`}</div>
+    </article>`).join('');
+  byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">APPLICATION UPDATES</div><h2>Notifications</h2><p>Private updates about your applications. Open an update to see the latest status and any information request.</p></div></div>
+    <section class="panel"><div class="panel-head"><div><div class="panel-title">${number(result.unread_count)} unread</div><div class="panel-subtitle">Updates are saved to your account and remain here after you sign out.</div></div></div>
+    <div class="notification-list" aria-live="polite">${cards || '<div class="empty-state"><strong>No notifications yet</strong>Application decisions and information requests will appear here.</div>'}</div></section>`;
+  refreshNotificationBadge();
 }
 
 function confirmModal(title, message, action, id, decision) {
@@ -450,6 +494,18 @@ document.addEventListener('click', async (event) => {
       await api(`/api/applications/${encodeURIComponent(action.dataset.id)}/predict`, { method: 'POST' });
       await renderApplicationDetail(action.dataset.id); showNotice('New prediction saved; earlier assessments remain in the history.', 'success'); return;
     }
+    if (name === 'open-notification') {
+      if (action.dataset.isRead !== 'true') {
+        await api(`/api/notifications/${encodeURIComponent(action.dataset.id)}/read`, { method: 'PATCH' });
+        await refreshNotificationBadge();
+      }
+      navigate('application-detail', { id: action.dataset.applicationId }); return;
+    }
+    if (name === 'mark-notification-read') {
+      action.disabled = true;
+      await api(`/api/notifications/${encodeURIComponent(action.dataset.id)}/read`, { method: 'PATCH' });
+      await refreshNotificationBadge(); await renderNotifications(); return;
+    }
     if (name === 'decision') {
       const decision = action.dataset.decision;
       const messages = { APPROVED: 'Record an approval after completing your review?', REJECTED: 'Record a rejection after completing your review?', NEEDS_MORE_INFORMATION: 'Ask the applicant to provide additional information?' };
@@ -466,8 +522,17 @@ document.addEventListener('click', async (event) => {
         byId('decision-notes')?.focus();
         return;
       }
+      action.disabled = true;
+      action.textContent = 'Saving…';
       await api(`/api/applications/${encodeURIComponent(action.dataset.id)}/decision`, { method: 'POST', body: JSON.stringify({ decision, notes: note }) });
-      byId('workspace').querySelector('.modal-backdrop')?.remove(); await renderApplicationDetail(action.dataset.id); showNotice('Analyst decision recorded in the audit history.', 'success'); return;
+      action.closest('.modal-backdrop')?.remove();
+      try {
+        await renderApplicationDetail(action.dataset.id);
+        showNotice('Decision recorded. The application status and applicant notification are now updated.', 'success');
+      } catch (refreshError) {
+        showNotice(`The decision was saved, but this page could not refresh. Reopen the application to confirm its latest status. ${refreshError.message}`, 'error');
+      }
+      return;
     }
     if (name === 'dismiss-modal') { action.closest('.modal-backdrop')?.remove(); return; }
     if (name === 'edit-application') {
@@ -489,6 +554,11 @@ document.addEventListener('click', async (event) => {
       await api(`/api/users/${encodeURIComponent(action.dataset.id)}/active`, { method: 'PATCH', body: JSON.stringify({ active: action.dataset.active === 'true' }) }); await renderUsers(); showNotice(action.dataset.active === 'true' ? 'User account activated.' : 'User account deactivated.', 'success'); return;
     }
   } catch (error) {
+    if (name === 'confirm-decision') {
+      action.disabled = false;
+      action.textContent = 'Continue';
+    }
+    if (name === 'mark-notification-read') action.disabled = false;
     const modal = action.closest('.modal');
     if (modal) {
       let feedback = modal.querySelector('.modal-feedback');

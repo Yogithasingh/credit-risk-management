@@ -57,6 +57,28 @@ RATE_LIMITS: dict[str, tuple[int, int]] = {
 }
 _request_times: defaultdict[str, deque[float]] = defaultdict(deque)
 _rate_lock = asyncio.Lock()
+APPLICANT_STATUS_GUIDANCE = {
+    "AI_ASSESSED": {
+        "summary": "Your application has been submitted and assessed. It is waiting for an authorized member of the credit team to review it.",
+        "next_action": "No action is needed right now. Check this page for updates.",
+    },
+    "UNDER_REVIEW": {
+        "summary": "An authorized member of the credit team is reviewing your application. A final decision has not been recorded yet.",
+        "next_action": "Please wait for the review to finish. The current status will update here.",
+    },
+    "APPROVED": {
+        "summary": "Your application has been reviewed, and an authorized member of the credit team has recorded an approval decision.",
+        "next_action": "Review this status for any further instructions. This demonstration does not create a binding loan offer, complete verification, sign an agreement, or transfer money.",
+    },
+    "REJECTED": {
+        "summary": "An authorized member of the credit team has recorded a rejection decision for your application.",
+        "next_action": "This page records the decision in the CrediGuard demonstration. No funds or financial agreement are created by this application.",
+    },
+    "NEEDS_MORE_INFORMATION": {
+        "summary": "The credit team needs more information before it can continue reviewing your application.",
+        "next_action": "Read the request below, update the application details, and resubmit them for a new assessment.",
+    },
+}
 
 
 @asynccontextmanager
@@ -247,12 +269,23 @@ def _application_audit(db, application_id: str, applicant_view: bool = False) ->
     events = []
     for row in rows:
         details = json.loads(row["details"])
-        if applicant_view and details.get("decision") != "NEEDS_MORE_INFORMATION":
-            details.pop("notes", None)
+        if applicant_view:
+            if row["action"] not in {
+                "APPLICATION_SUBMITTED",
+                "PREDICTION_GENERATED",
+                "ANALYST_REVIEW_STARTED",
+                "ANALYST_DECISION_RECORDED",
+                "APPLICANT_INFORMATION_RESUBMITTED",
+            }:
+                continue
+            decision = details.get("decision")
+            details = {"decision": decision} if row["action"] == "ANALYST_DECISION_RECORDED" else {}
+            if decision == "NEEDS_MORE_INFORMATION":
+                original = json.loads(row["details"])
+                details["notes"] = original.get("notes", "")
         events.append(
             {
                 "actor": "You" if applicant_view and row["actor_role"] == "APPLICANT" else "Credit team" if applicant_view else row["actor_email"],
-                "role": row["actor_role"],
                 "action": row["action"],
                 "details": details,
                 "created_at": row["created_at"],
@@ -277,6 +310,10 @@ def _visible_application(row, user: dict[str, Any]) -> dict[str, Any]:
             result["analyst_notes"] = ""
         result["analyst_id"] = None
         result["analyst_name"] = None
+        result["applicant_status"] = APPLICANT_STATUS_GUIDANCE.get(
+            result["status"],
+            {"summary": "Your application status is available here.", "next_action": "Check this page for updates."},
+        )
     return result
 
 
@@ -352,6 +389,65 @@ def logout(response: Response, user: dict[str, Any] = Depends(_current_user)):
 @app.get("/api/auth/me")
 def who_am_i(user: dict[str, Any] = Depends(_current_user)):
     return {"user": user}
+
+
+@app.get("/api/notifications")
+def list_notifications(
+    user: dict[str, Any] = Depends(_current_user),
+    page: int = Query(default=1, ge=1, le=100000),
+    page_size: int = Query(default=50, ge=1, le=100),
+):
+    with database.connect() as db:
+        total = db.execute(
+            "SELECT COUNT(*) AS n FROM notifications WHERE recipient_id=?",
+            (user["id"],),
+        ).fetchone()["n"]
+        unread_count = db.execute(
+            "SELECT COUNT(*) AS n FROM notifications WHERE recipient_id=? AND read_at IS NULL",
+            (user["id"],),
+        ).fetchone()["n"]
+        rows = db.execute(
+            "SELECT * FROM notifications WHERE recipient_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+            (user["id"], page_size, (page - 1) * page_size),
+        ).fetchall()
+    return {
+        "items": [database.notification_public(row) for row in rows],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": max(1, (total + page_size - 1) // page_size),
+        "unread_count": unread_count,
+    }
+
+
+@app.patch("/api/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: str, user: dict[str, Any] = Depends(_current_user)):
+    with database.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT * FROM notifications WHERE id=? AND recipient_id=?",
+            (notification_id, user["id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Notification not found.")
+        if row["read_at"] is None:
+            db.execute(
+                "UPDATE notifications SET read_at=? WHERE id=? AND recipient_id=? AND read_at IS NULL",
+                (database.utc_now(), notification_id, user["id"]),
+            )
+            database.audit(
+                db,
+                user,
+                "NOTIFICATION_READ",
+                "notification",
+                notification_id,
+                {"application_id": row["application_id"]},
+            )
+        updated = db.execute(
+            "SELECT * FROM notifications WHERE id=? AND recipient_id=?",
+            (notification_id, user["id"]),
+        ).fetchone()
+    return database.notification_public(updated)
 
 
 @app.get("/api/dashboard/summary")
@@ -447,9 +543,9 @@ def create_application(payload: ApplicationInput, user: dict[str, Any] = Depends
     values = _feature_payload(payload)
     with database.connect() as db:
         db.execute(
-            """INSERT INTO applications(id,applicant_id,status,applicant_name,application_data,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?)""",
-            (application_id, user["id"], "AI_ASSESSED", user["full_name"], json.dumps(values, separators=(",", ":")), now, now),
+            """INSERT INTO applications(id,applicant_id,status,applicant_name,application_data,created_at,updated_at,status_updated_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (application_id, user["id"], "AI_ASSESSED", user["full_name"], json.dumps(values, separators=(",", ":")), now, now, now),
         )
         _prediction_id, prediction = _create_prediction(db, application_id, values, user)
         database.audit(db, user, "APPLICATION_SUBMITTED", "application", application_id, {"status": "AI_ASSESSED"})
@@ -479,11 +575,12 @@ def get_application(application_id: str, user: dict[str, Any] = Depends(_current
 def reassess_application(application_id: str, user: dict[str, Any] = Depends(_current_user)):
     _staff(user)
     with database.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         row = _get_application(db, application_id)
         if not row:
             raise HTTPException(status_code=404, detail="Application not found.")
-        if row["status"] in {"APPROVED", "REJECTED"}:
-            raise HTTPException(status_code=409, detail="A final decision has been recorded; this application cannot be reassessed.")
+        if row["status"] not in {"AI_ASSESSED", "UNDER_REVIEW"}:
+            raise HTTPException(status_code=409, detail="This application is not available for a new assessment in its current state.")
         values = json.loads(row["application_data"])
         _prediction_id, prediction = _create_prediction(db, application_id, values, user)
         database.audit(db, user, "APPLICATION_REASSESSED", "application", application_id, {"model_version": prediction["model_version"]})
@@ -497,13 +594,19 @@ def reassess_application(application_id: str, user: dict[str, Any] = Depends(_cu
 def start_review(application_id: str, user: dict[str, Any] = Depends(_current_user)):
     _staff(user)
     with database.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         row = _get_application(db, application_id)
         if not row:
             raise HTTPException(status_code=404, detail="Application not found.")
         if row["status"] != "AI_ASSESSED":
             raise HTTPException(status_code=409, detail="This application is not waiting for analyst review.")
         now = database.utc_now()
-        db.execute("UPDATE applications SET status='UNDER_REVIEW',analyst_id=?,updated_at=? WHERE id=?", (user["id"], now, application_id))
+        changed = db.execute(
+            "UPDATE applications SET status='UNDER_REVIEW',analyst_id=?,updated_at=?,status_updated_at=? WHERE id=? AND status='AI_ASSESSED'",
+            (user["id"], now, now, application_id),
+        )
+        if changed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="This application is no longer waiting for analyst review.")
         database.audit(db, user, "ANALYST_REVIEW_STARTED", "application", application_id, {"status": "UNDER_REVIEW"})
         row = _get_application(db, application_id)
     return _visible_application(row, user)
@@ -515,17 +618,49 @@ def record_decision(application_id: str, payload: DecisionInput, user: dict[str,
     if payload.decision == "NEEDS_MORE_INFORMATION" and not payload.notes:
         raise HTTPException(status_code=422, detail="Add a note explaining what information is required.")
     with database.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         row = _get_application(db, application_id)
         if not row:
             raise HTTPException(status_code=404, detail="Application not found.")
-        if row["status"] not in {"UNDER_REVIEW", "AI_ASSESSED"}:
-            raise HTTPException(status_code=409, detail="This application has already received a final decision or is awaiting the applicant.")
+        if row["status"] != "UNDER_REVIEW":
+            raise HTTPException(status_code=409, detail="Start analyst review before recording a decision. This application may already have a decision or be awaiting the applicant.")
         now = database.utc_now()
-        db.execute(
-            "UPDATE applications SET status=?,decision=?,decision_at=?,analyst_id=?,analyst_notes=?,updated_at=? WHERE id=?",
-            (payload.decision, payload.decision, now, user["id"], payload.notes, now, application_id),
+        changed = db.execute(
+            "UPDATE applications SET status=?,decision=?,decision_at=?,analyst_id=?,analyst_notes=?,updated_at=?,status_updated_at=? WHERE id=? AND status='UNDER_REVIEW'",
+            (payload.decision, payload.decision, now, user["id"], payload.notes, now, now, application_id),
         )
-        database.audit(db, user, "ANALYST_DECISION_RECORDED", "application", application_id, {"decision": payload.decision, "notes": payload.notes})
+        if changed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Another reviewer updated this application. Reload it before trying again.")
+        event_id = database.audit(
+            db,
+            user,
+            "ANALYST_DECISION_RECORDED",
+            "application",
+            application_id,
+            {"decision": payload.decision, "notes": payload.notes},
+        )
+        notification_type, notification_message = {
+            "APPROVED": (
+                "APPLICATION_APPROVED",
+                "Your application has been reviewed, and an authorized member of the credit team has recorded an approval decision. Please review the application status for any further instructions. This demonstration does not create a binding loan offer or transfer funds.",
+            ),
+            "REJECTED": (
+                "APPLICATION_REJECTED",
+                "An authorized member of the credit team has recorded a rejection decision for your application. View the application status page for the recorded outcome.",
+            ),
+            "NEEDS_MORE_INFORMATION": (
+                "APPLICATION_INFORMATION_REQUESTED",
+                "The credit team needs more information to continue reviewing your application. Open the application status page to read the request and respond.",
+            ),
+        }[payload.decision]
+        database.create_notification(
+            db,
+            row["applicant_id"],
+            application_id,
+            event_id,
+            notification_type,
+            notification_message,
+        )
         row = _get_application(db, application_id)
     return _visible_application(row, user)
 
@@ -536,16 +671,20 @@ def resubmit_information(application_id: str, payload: ApplicationInput, user: d
         raise HTTPException(status_code=403, detail="Only the applicant can update requested information.")
     values = _feature_payload(payload)
     with database.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         row = _get_application(db, application_id)
         if not row:
             raise HTTPException(status_code=404, detail="Application not found.")
         _check_application_access(row, user)
         if row["status"] != "NEEDS_MORE_INFORMATION":
             raise HTTPException(status_code=409, detail="This application is not awaiting more information.")
-        db.execute(
-            "UPDATE applications SET application_data=?,status='AI_ASSESSED',analyst_id=NULL,analyst_notes='',decision=NULL,decision_at=NULL,updated_at=? WHERE id=?",
-            (json.dumps(values, separators=(",", ":")), database.utc_now(), application_id),
+        now = database.utc_now()
+        changed = db.execute(
+            "UPDATE applications SET application_data=?,status='AI_ASSESSED',analyst_id=NULL,analyst_notes='',decision=NULL,decision_at=NULL,updated_at=?,status_updated_at=? WHERE id=? AND status='NEEDS_MORE_INFORMATION'",
+            (json.dumps(values, separators=(",", ":")), now, now, application_id),
         )
+        if changed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="This application is no longer awaiting more information.")
         _prediction_id, prediction = _create_prediction(db, application_id, values, user)
         database.audit(db, user, "APPLICANT_INFORMATION_RESUBMITTED", "application", application_id, {"status": "AI_ASSESSED"})
         row = _get_application(db, application_id)

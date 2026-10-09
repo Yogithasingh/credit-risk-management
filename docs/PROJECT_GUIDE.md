@@ -57,12 +57,13 @@ In Docker, the Python process writes its database, model artifacts, and generate
 3. For a new application, FastAPI saves the submitted profile and creates a prediction. The application starts with status `AI_ASSESSED`.
 4. The applicant can see their own applications and their prediction history. The server checks ownership on each detail request; applicant accounts cannot browse another person's application.
 5. If an analyst requests more information, the application changes to `NEEDS_MORE_INFORMATION`. The applicant can update that application, which returns it to `AI_ASSESSED` and creates another prediction record.
+6. When a staff member records approval, rejection, or an information request, the applicant receives a saved in-app notification. The applicant can open it to see the current status; marking it read is saved too.
 
 ### Analyst and administrator
 
 1. A staff member signs in and sees the staff dashboard and application queue. The API applies role checks for staff-only routes.
 2. The analyst can search, filter, open an application, and start review. Starting review changes `AI_ASSESSED` to `UNDER_REVIEW`.
-3. An analyst or administrator may record `APPROVED`, `REJECTED`, or `NEEDS_MORE_INFORMATION`. A note is required when requesting more information. Final decisions are human-entered; a risk band never automatically makes the decision.
+3. An analyst or administrator may record `APPROVED`, `REJECTED`, or `NEEDS_MORE_INFORMATION` after starting review. A note is required when requesting more information. The status change, reviewer and time, audit event, and applicant notification are committed together. A risk band never automatically makes the decision.
 4. Staff can export reports and inspect model information. Administrators additionally manage user roles/active status, change risk thresholds, and retrain/activate a model.
 
 The main workflow is:
@@ -90,7 +91,8 @@ FastAPI routes in `app/main.py` handle those requests. A typical protected reque
 3. A role helper checks whether this account is an applicant, staff member, or administrator for the requested action.
 4. The route reads or writes SQLite using helpers in `app/database.py`. Database writes are committed when the connection context finishes successfully and rolled back if an error occurs.
 5. For a scoring request, the route asks `ml/service.py` for a probability, applies the current risk thresholds, stores a prediction snapshot, and writes an audit event.
-6. FastAPI returns JSON (or a PDF/CSV download), and the browser updates the page.
+6. A decision request updates the application only if it is still `UNDER_REVIEW`. SQLite serializes that state check and update so reviewers cannot record contradictory outcomes. The decision, audit event, and notification share one transaction and are either all saved or all rolled back.
+7. FastAPI returns JSON (or a PDF/CSV download), and the browser updates the page.
 
 Login sets an eight-hour, HTTP-only, same-site cookie. The browser JavaScript cannot read the cookie directly. Passwords are stored as salted scrypt hashes, not as plain text. The API also validates input, applies simple in-memory request limits to login, registration, and application creation, and adds browser security headers. Those rate-limit counters live in process memory and reset when the service restarts.
 
@@ -126,9 +128,10 @@ Every prediction stores the model version and the thresholds used at that time. 
 | Information | Storage location | What it contains |
 |---|---|---|
 | Accounts | SQLite `users` table | Name, unique email, scrypt password hash, role, active flag, creation time |
-| Applications | SQLite `applications` table | Applicant link, status, submitted financial/profile fields (JSON), assigned analyst, notes, decision, timestamps, pointer to latest prediction |
+| Applications | SQLite `applications` table | Applicant link, status and last status-change time, submitted financial/profile fields (JSON), assigned analyst, notes, decision, timestamps, pointer to latest prediction |
 | Prediction history | SQLite `predictions` table | Probability, 0–100 score, risk band, threshold snapshot, top factors, range warnings, model version, timestamp |
 | Audit trail | SQLite `audit_events` table | Actor, action, resource, details, timestamp; records logins, reviews, decisions, exports, and administrative changes |
+| Applicant notifications | SQLite `notifications` table | Recipient, related application, applicant-safe message, type, creation time, and read time; each notice is linked to one unique audit event |
 | Settings | SQLite `settings` table | Risk-band threshold settings |
 | Model run history | SQLite `model_runs` table | Model version, algorithm, time, active flag, metrics and metadata |
 | Model files | `instance/models/` locally, or `/app/instance/models/` in Docker | Versioned `.joblib` model artifact and matching `.json` metadata |
@@ -153,8 +156,8 @@ The BI export labels an application's actual repayment result `NOT_OBSERVED`. Th
 
 | File | Responsibility |
 |---|---|
-| `app/main.py` | Creates the FastAPI app; startup; static page delivery; request/security middleware; login and registration; role and ownership checks; application workflow; model/config/admin routes; dashboard; PDF/CSV exports. |
-| `app/database.py` | SQLite paths and connections; schema and indexes; bootstrap administrator; JSON conversion helpers; risk thresholds; application/prediction database queries and public response shapes. |
+| `app/main.py` | Creates the FastAPI app; startup; static page delivery; request/security middleware; login and registration; role and ownership checks; application workflow; applicant status guidance and notification routes; model/config/admin routes; dashboard; PDF/CSV exports. |
+| `app/database.py` | SQLite paths and connections; schema and safe table creation for existing databases; bootstrap administrator; audit/notification helpers; risk thresholds; application/prediction queries and public response shapes. |
 | `app/security.py` | Password hashing and verification, session secret creation/loading, and signing/checking the HTTP-only browser session token. |
 | `app/schemas.py` | Input rules for account, application, decision, threshold, and user-management requests. |
 | `app/__init__.py` | Marks `app` as a Python package. |
@@ -165,10 +168,11 @@ The BI export labels an application's actual repayment result `NOT_OBSERVED`. Th
 |---|---|
 | `app/static/index.html` | Main browser page structure: sign-in/register area and the workspace shell. |
 | `app/static/styles.css` | Layout, colors, responsive behavior, forms, tables, badges, and other interface styling. |
-| `app/static/app.js` | Calls the backend API, manages the signed-in browser state and navigation, builds dashboard/forms/tables/details, and handles user actions. |
+| `app/static/app.js` | Calls the backend API, manages the signed-in browser state and navigation, builds dashboard/forms/tables/details and the notification inbox, and handles user actions. Decision buttons show loading/error states and refresh the saved application after success. |
 | `app/static/api-docs.html` | Page shell for the project's API reference. |
 | `app/static/docs.css` | Styles the API reference page. |
 | `app/static/docs.js` | Reads FastAPI's `/openapi.json` definition and displays its endpoint reference. |
+| `tests/test_application_lifecycle.py` | Standard-library regression tests for review decisions, notification privacy/read state, duplicate and concurrent submissions, information requests/resubmission, and safe schema upgrades. |
 
 ### Model and data
 
@@ -224,6 +228,6 @@ The components used here are open-source or freely available. A server, domain, 
 - `/api/health` — database and model readiness check.
 - `/api/dashboard/summary` — applicant's own summary or staff portfolio summary.
 - `/api/applications` — applicant history or staff review queue.
+- `/api/notifications` and `/api/notifications/{id}/read` — the signed-in user's own notification inbox and read state.
 - `/api/models/active` — staff view of active model details and recent versions.
 - `/api/reports/applications.csv` and `/api/reports/powerbi.csv` — staff CSV downloads.
-

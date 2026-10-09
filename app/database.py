@@ -1,10 +1,11 @@
-"""SQLite persistence for accounts, applications, predictions, settings, and audit events."""
+"""SQLite persistence for accounts, applications, predictions, notifications, and audit events."""
 
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,7 +69,8 @@ def init_database() -> None:
                 decision TEXT,
                 decision_at TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                status_updated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS predictions (
@@ -96,6 +98,17 @@ def init_database() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS notifications (
+                id TEXT PRIMARY KEY,
+                recipient_id TEXT NOT NULL REFERENCES users(id),
+                application_id TEXT NOT NULL REFERENCES applications(id),
+                audit_event_id INTEGER NOT NULL UNIQUE REFERENCES audit_events(id),
+                notification_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                read_at TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -119,6 +132,8 @@ def init_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_predictions_application ON predictions(application_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_events(resource_type, resource_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(recipient_id, read_at, created_at DESC);
             """
         )
         db.execute(
@@ -128,6 +143,12 @@ def init_database() -> None:
         prediction_columns = {row["name"] for row in db.execute("PRAGMA table_info(predictions)").fetchall()}
         if "thresholds" not in prediction_columns:
             db.execute("ALTER TABLE predictions ADD COLUMN thresholds TEXT NOT NULL DEFAULT '{}' ")
+        application_columns = {row["name"] for row in db.execute("PRAGMA table_info(applications)").fetchall()}
+        if "status_updated_at" not in application_columns:
+            db.execute("ALTER TABLE applications ADD COLUMN status_updated_at TEXT")
+        db.execute(
+            "UPDATE applications SET status_updated_at=COALESCE(decision_at,updated_at,created_at) WHERE status_updated_at IS NULL"
+        )
 
 
 def ensure_bootstrap_admin() -> None:
@@ -168,8 +189,8 @@ def audit(
     resource_type: str,
     resource_id: str | None = None,
     details: dict[str, Any] | None = None,
-) -> None:
-    db.execute(
+) -> int:
+    cursor = db.execute(
         """INSERT INTO audit_events(actor_id,actor_email,actor_role,action,resource_type,resource_id,details,created_at)
            VALUES(?,?,?,?,?,?,?,?)""",
         (
@@ -183,6 +204,52 @@ def audit(
             utc_now(),
         ),
     )
+    return int(cursor.lastrowid)
+
+
+def create_notification(
+    db: sqlite3.Connection,
+    recipient_id: str,
+    application_id: str,
+    audit_event_id: int,
+    notification_type: str,
+    message: str,
+) -> dict[str, Any]:
+    notification = {
+        "id": str(uuid.uuid4()),
+        "recipient_id": recipient_id,
+        "application_id": application_id,
+        "audit_event_id": audit_event_id,
+        "notification_type": notification_type,
+        "message": message,
+        "created_at": utc_now(),
+    }
+    db.execute(
+        """INSERT INTO notifications(id,recipient_id,application_id,audit_event_id,notification_type,message,created_at)
+           VALUES(?,?,?,?,?,?,?)""",
+        (
+            notification["id"],
+            notification["recipient_id"],
+            notification["application_id"],
+            notification["audit_event_id"],
+            notification["notification_type"],
+            notification["message"],
+            notification["created_at"],
+        ),
+    )
+    return notification
+
+
+def notification_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "application_id": row["application_id"],
+        "notification_type": row["notification_type"],
+        "message": row["message"],
+        "created_at": row["created_at"],
+        "read_at": row["read_at"],
+        "is_read": row["read_at"] is not None,
+    }
 
 
 def get_thresholds(db: sqlite3.Connection) -> dict[str, float]:
@@ -244,6 +311,7 @@ def application_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "decision_at": row["decision_at"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "status_updated_at": row["status_updated_at"] if "status_updated_at" in keys else row["updated_at"],
     }
 
 

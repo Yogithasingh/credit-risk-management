@@ -8,11 +8,11 @@ For a plain-language explanation of the application flow, backend, storage, mode
 
 ## What works
 
-- Applicant registration, sign-in, private application history, and requested-information resubmission.
+- Applicant registration, sign-in, private application status/history, requested-information resubmission, and persistent in-app notifications.
 - Analyst queue with server-side search, risk/status filters, application detail, review transitions, and approve/reject/request-information decisions.
 - Admin user access controls, configurable risk bands, model retraining, version history, and audit history.
 - A real scikit-learn/XGBoost training pipeline, held-out metrics, local feature sensitivity display, and saved model artifacts.
-- SQLite-backed applications, immutable prediction records, human decisions, settings, and audit events.
+- SQLite-backed applications, immutable prediction records, human decisions, recipient-scoped notifications, settings, and audit events.
 - Per-application PDF reports, CSV exports for operational reports, and BI-ready CSV ingestion; current applications have no repayment outcome, so the export marks actual default as `NOT_OBSERVED`.
 - Responsive browser UI, API documentation, health endpoint, Docker Compose, and a Caddy reverse proxy for HTTPS.
 
@@ -160,11 +160,22 @@ The local API reference at `/docs` reads endpoint definitions from FastAPI's Ope
 | Health | `GET /api/health` |
 | Authentication | `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
 | Applications | `GET/POST /api/applications`, `GET /api/applications/{id}` (includes prediction history), `POST /api/applications/{id}/predict`, `POST /api/applications/{id}/review`, `POST /api/applications/{id}/decision`, `PUT /api/applications/{id}/information` |
+| Notifications | `GET /api/notifications`, `PATCH /api/notifications/{id}/read` (signed-in user's notifications only) |
 | Dashboard | `GET /api/dashboard/summary` |
 | Models | `GET /api/models/active`, `POST /api/models/retrain` (admin) |
 | Configuration | `GET/PUT /api/config/risk` |
 | Admin | `GET /api/users`, `PATCH /api/users/{id}/role`, `PATCH /api/users/{id}/active`, `GET /api/audit` |
 | Reports | `GET /api/reports/applications/{id}.pdf`, `GET /api/reports/applications.csv`, `GET /api/reports/powerbi.csv` |
+
+## Run lifecycle checks
+
+With the project dependencies installed, run the focused workflow and privacy checks with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The tests use a temporary SQLite database and stub the model response where needed; they do not touch the running application's Docker volume.
 
 ## BI-ready CSV
 
