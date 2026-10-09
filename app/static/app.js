@@ -387,10 +387,11 @@ async function renderAudit() {
 function confirmModal(title, message, action, id, decision) {
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
-  backdrop.dataset.action = 'dismiss-modal';
   backdrop.innerHTML = `<section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><h3 id="modal-title">${escapeHtml(title)}</h3><p>${escapeHtml(message)}</p>${decision === 'NEEDS_MORE_INFORMATION' ? '<label class="field" style="margin-top:12px">What information is needed?<textarea id="decision-notes" maxlength="3000" required placeholder="Describe the documents or details requested"></textarea></label>' : decision ? '<label class="field" style="margin-top:12px">Analyst note (optional)<textarea id="decision-notes" maxlength="3000" placeholder="Add a concise review note"></textarea></label>' : ''}<div class="modal-actions"><button class="button button-outline" data-action="dismiss-modal">Cancel</button><button class="button ${decision==='REJECTED'?'button-danger':'button-primary'}" data-action="${action}" data-id="${escapeHtml(id)}" data-decision="${escapeHtml(decision||'')}">Continue</button></div></section>`;
+  backdrop.addEventListener('click', (event) => {
+    if (event.target === backdrop) backdrop.remove();
+  });
   byId('workspace').appendChild(backdrop);
-  backdrop.querySelector('.modal').addEventListener('click', (event) => event.stopPropagation());
 }
 function demoValues() {
   const sample = { loan_amount: 12000, term_months: 36, annual_income: 72000, home_ownership: 'RENT', purpose: 'debt_consolidation', dti: 18.5, prior_delinquencies: 0, fico_score: 710, recent_credit_inquiries: 1, open_accounts: 9, public_records: 0, revolving_balance: 8500, revolving_utilization: 28, total_accounts: 20 };
