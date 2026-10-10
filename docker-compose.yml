@@ -11,6 +11,7 @@ services:
       ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       SESSION_SECRET: ${SESSION_SECRET:-}
+      FX_API_BASE_URL: ${FX_API_BASE_URL:-https://api.frankfurter.dev/v2}
     volumes:
       - app_data:/app/instance
     expose:

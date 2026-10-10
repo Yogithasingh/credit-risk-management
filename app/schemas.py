@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.regional import SUPPORTED_LOCALES
+from app import regional
 
 
 class RegisterInput(BaseModel):
@@ -40,9 +40,11 @@ class LoginInput(BaseModel):
 class ApplicationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # Defaults retain the original API contract, whose only accepted inputs were USD.
+    # USD defaults preserve the original API contract for existing callers.
     country_code: Literal["US"] = "US"
-    currency_code: Literal["USD"] = "USD"
+    currency_code: str = "USD"
+    fx_quote_id: str | None = Field(default=None, max_length=36)
+    currency_confirmed: bool = False
     loan_amount: float = Field(gt=0, le=1_000_000)
     term_months: Literal[36, 60]
     annual_income: float = Field(gt=0, le=100_000_000)
@@ -74,20 +76,50 @@ class ApplicationInput(BaseModel):
     revolving_utilization: float = Field(ge=0, le=300)
     total_accounts: int = Field(ge=0, le=1000)
 
+    @field_validator("currency_code")
+    @classmethod
+    def supported_input_currency(cls, value: str) -> str:
+        value = value.strip().upper()
+        if not regional.supported_currency(value):
+            raise ValueError("Choose a supported input currency (USD, INR, GBP, or EUR).")
+        return value
+
 
 class RegionalPreferenceInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     country_code: Literal["US"]
-    currency_code: Literal["USD"]
+    currency_code: str
     locale_code: str
+
+    @field_validator("currency_code")
+    @classmethod
+    def supported_input_currency(cls, value: str) -> str:
+        value = value.strip().upper()
+        if not regional.supported_currency(value):
+            raise ValueError("Choose a supported input currency (USD, INR, GBP, or EUR).")
+        return value
 
     @field_validator("locale_code")
     @classmethod
     def supported_locale(cls, value: str) -> str:
-        supported = {item["locale_code"] for item in SUPPORTED_LOCALES}
+        supported = {item["locale_code"] for item in regional.SUPPORTED_LOCALES}
         if value not in supported:
             raise ValueError("Choose a supported display locale.")
+        return value
+
+
+class CurrencyQuoteInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    currency_code: str
+
+    @field_validator("currency_code")
+    @classmethod
+    def supported_input_currency(cls, value: str) -> str:
+        value = value.strip().upper()
+        if not regional.supported_currency(value):
+            raise ValueError("Choose a supported input currency (USD, INR, GBP, or EUR).")
         return value
 
 

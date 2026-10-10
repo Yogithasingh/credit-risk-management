@@ -1,4 +1,4 @@
-const state = { user: null, page: 'dashboard', applicationPage: 1, applicationPages: 1, auditPage: 1, busy: false, regionalOptions: null, applicationSetupConfirmed: false, applicationEditing: false, applicationEditingValues: null };
+const state = { user: null, page: 'dashboard', applicationPage: 1, applicationPages: 1, auditPage: 1, busy: false, regionalOptions: null, applicationSetupConfirmed: false, applicationEditing: false, applicationEditingValues: null, applicationFxQuote: null, currencyQuoteRequest: 0, applicationFxQuoteError: '' };
 const byId = (id) => document.getElementById(id);
 const MONEY_FEATURES = new Set(['loan_amount', 'annual_income', 'revolving_balance']);
 function displayLocale() { return state.user?.locale_code || 'en-US'; }
@@ -160,6 +160,7 @@ function navigate(page, data = {}) {
     state.applicationEditing = false;
     state.applicationEditingValues = null;
     state.applicationSetupConfirmed = false;
+    state.applicationFxQuote = null;
   }
   state.page = page;
   if (data.id) state.applicationId = data.id;
@@ -180,9 +181,9 @@ async function renderPage() {
     else if (state.page === 'applications') await renderApplications();
     else if (state.page === 'notifications' && state.user.role === 'APPLICANT') await renderNotifications();
     else if (state.page === 'new-application') {
-      if (state.applicationEditing) renderApplicationForm(state.applicationEditingValues);
+      if (state.applicationEditing) await renderApplicationForm(state.applicationEditingValues);
       else if (!state.applicationSetupConfirmed) await renderRegionalSetup();
-      else renderApplicationForm();
+      else await renderApplicationForm();
     }
     else if (state.page === 'application-detail') await renderApplicationDetail(state.applicationId);
     else if (state.page === 'model') await renderModel();
@@ -286,25 +287,52 @@ async function renderRegionalSetup() {
   const options = state.regionalOptions || await api('/api/config/regional');
   state.regionalOptions = options;
   const market = options.supported_markets.find((entry) => entry.country_code === (state.user.country_code || 'US')) || options.supported_markets[0];
-  const currencyChoice = `${market.currency_code} — ${market.currency_name} — ${market.country_name} — ${market.currency_symbol}`;
+  const selectedCurrency = options.supported_currencies.find((entry) => entry.currency_code === (state.user.currency_code || 'USD')) || options.supported_currencies[0];
   const localeCode = state.user.locale_code || browserLocaleSuggestion(options.supported_locales);
   const countryOptions = [
     ...options.supported_markets.map((entry) => `<option value="${escapeHtml(entry.country_code)}" selected>${escapeHtml(entry.country_name)} (${escapeHtml(entry.country_code)}) — supported application market</option>`),
-    ...options.unsupported_markets.map((entry) => `<option value="${escapeHtml(entry.country_code)}" disabled>${escapeHtml(entry.country_name)} (${escapeHtml(entry.country_code)}) — ${escapeHtml(entry.currency_code)} not supported by this model</option>`),
+    ...options.unsupported_markets.map((entry) => `<option value="${escapeHtml(entry.country_code)}" disabled>${escapeHtml(entry.country_name)} (${escapeHtml(entry.country_code)}) — ${escapeHtml(entry.reason)}</option>`),
   ].join('');
   const localeOptions = options.supported_locales.map((entry) => `<option value="${escapeHtml(entry.locale_code)}" ${entry.locale_code === localeCode ? 'selected' : ''}>${escapeHtml(entry.name)} — ${escapeHtml(entry.locale_code)}</option>`).join('');
   byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">BEFORE YOU APPLY</div><h2>Choose region and currency</h2><p>Confirm the market and denomination before entering any financial amounts.</p></div></div>
     <section class="panel regional-setup"><div class="panel-head"><div><div class="panel-title">Application settings</div><div class="panel-subtitle">Your choices are saved with your account and copied onto each new application.</div></div></div>
-      <div class="panel-body"><div class="callout warning"><strong>Model support is limited to the United States and USD.</strong> The supplied LendingClub model uses raw USD loan, income, and revolving-balance features. There is no currency conversion. This is the application's lending market selection; it does not establish your residence, nationality, identity, eligibility, or identity-verification jurisdiction.</div>
+      <div class="panel-body"><div class="callout warning"><strong>The supported credit market remains the United States.</strong> The supported input currency may be USD, INR, GBP, or EUR. Non-USD monetary amounts are converted to USD with a dated reference rate before scoring. This does not validate the model for another country's credit system or establish residence, nationality, identity, eligibility, or identity-verification jurisdiction.</div>
         <form id="regional-form" class="field-grid" style="margin-top:16px">
           <div class="field"><label for="application-country">Country / application market</label><select id="application-country" name="country_code" required>${countryOptions}</select><span class="field-hint">Other markets are listed as unavailable until the model is validated for them.</span></div>
-          <div class="field"><label for="application-currency">Search supported currencies</label><input id="application-currency" name="currency_choice" type="search" list="supported-currencies" value="${escapeHtml(currencyChoice)}" autocomplete="off" required><datalist id="supported-currencies">${options.supported_markets.map((entry) => `<option value="${escapeHtml(`${entry.currency_code} — ${entry.currency_name} — ${entry.country_name} — ${entry.currency_symbol}`)}"></option>`).join('')}</datalist><span class="field-hint">Currency is identified by its ISO 4217 code; the code will appear with monetary amounts.</span></div>
+          <div class="field"><label for="application-currency">Currency used for financial amounts</label><select id="application-currency" name="currency_code" required>${options.supported_currencies.map((entry) => `<option value="${escapeHtml(entry.currency_code)}" ${entry.currency_code === selectedCurrency.currency_code ? 'selected' : ''}>${escapeHtml(entry.currency_code)} - ${escapeHtml(entry.currency_name)} (${escapeHtml(entry.currency_symbol)})</option>`).join('')}</select><span class="field-hint">Choose an ISO 4217 code. Monetary amounts are converted to USD for the model.</span><span id="currency-quote-status" class="field-hint" role="status" aria-live="polite">Loading a dated exchange-rate quote...</span></div>
           <div class="field"><label for="display-locale">Number and date display locale</label><select id="display-locale" name="locale_code" required>${localeOptions}</select><span class="field-hint">A browser-language suggestion is used for display only. The interface remains in English; this does not detect your country.</span></div>
-          <div class="field-full"><label class="regional-confirm"><input type="checkbox" name="currency_confirmed" value="yes" required><span>I confirm that the financial amounts I enter next, including loan amount, annual income, and revolving balance, will be denominated in ${escapeHtml(market.currency_code)}.</span></label></div>
-          <div class="field-full form-foot"><small>Country/market, currency, locale, and identity verification are separate. Currency selection is not proof of identity or residence.</small><button class="button button-primary" type="submit">Confirm and continue</button></div>
+          <div class="field-full"><label class="regional-confirm"><input type="checkbox" name="currency_confirmed" value="yes" required><span id="currency-confirmation-text">I confirm that financial amounts will be entered in ${escapeHtml(selectedCurrency.currency_code)} and converted to USD using the dated rate shown above.</span></label></div>
+          <div class="field-full form-foot"><small>The application market remains US. Currency is only the denomination of the amounts entered; it is not proof of residence, nationality, identity, or verification jurisdiction.</small><button class="button button-primary" type="submit" disabled>Confirm and continue</button></div>
         </form>
       </div>
     </section>`;
+  byId('application-currency').addEventListener('change', (event) => refreshCurrencyQuote(event.target.value));
+  await refreshCurrencyQuote(selectedCurrency.currency_code);
+}
+
+async function refreshCurrencyQuote(currencyCode) {
+  const code = String(currencyCode || '').toUpperCase();
+  const requestNumber = ++state.currencyQuoteRequest;
+      state.applicationFxQuote = null;
+  const checkbox = document.querySelector('#regional-form [name="currency_confirmed"]');
+  const button = document.querySelector('#regional-form button[type="submit"]');
+  const status = byId('currency-quote-status');
+  const confirmation = byId('currency-confirmation-text');
+  if (checkbox) checkbox.checked = false;
+  if (button) button.disabled = true;
+  if (confirmation) confirmation.textContent = `I confirm that financial amounts will be entered in ${code} and converted to USD using the dated rate shown above.`;
+  if (status) status.textContent = 'Loading a dated exchange-rate quote...';
+  try {
+    const quote = await api('/api/currency-quotes', { method: 'POST', body: JSON.stringify({ currency_code: code }) });
+    if (requestNumber !== state.currencyQuoteRequest || byId('application-currency')?.value !== code) return;
+    state.applicationFxQuote = quote;
+    const quoteDate = quote.rate_date ? `published ${quote.rate_date}` : 'identity conversion';
+    if (status) status.textContent = `1 ${code} = ${number(quote.rate, 6)} USD; ${quoteDate}; source: ${quote.source}. Expires ${dateText(quote.expires_at, true)}.`;
+    if (button) button.disabled = false;
+  } catch (error) {
+    if (requestNumber !== state.currencyQuoteRequest) return;
+    if (status) status.textContent = `${error.message} A valid quote is required before continuing.`;
+  }
 }
 
 const purposeOptions = [
@@ -338,20 +366,29 @@ function fieldHtml(field, value = '', currencyCode = 'USD') {
   const placeholder = MONEY_FEATURES.has(field.name) ? ` placeholder="Enter amount in ${escapeHtml(currencyCode)}"` : '';
   return `<div class="field">${label}<input name="${field.name}" type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${escapeHtml(value)}"${placeholder} required></label></div>`;
 }
-function renderApplicationForm(existing = null) {
+async function renderApplicationForm(existing = null) {
   const values = existing || {};
   const edit = Boolean(existing);
   const countryCode = values.country_code || state.user.country_code || 'US';
   const currencyCode = values.currency_code || state.user.currency_code || 'USD';
+  if (edit || !state.applicationFxQuote || state.applicationFxQuote.currency_code !== currencyCode) {
+    try { state.applicationFxQuote = await api('/api/currency-quotes', { method: 'POST', body: JSON.stringify({ currency_code: currencyCode }) }); state.applicationFxQuoteError = ''; }
+    catch (error) { state.applicationFxQuote = null; state.applicationFxQuoteError = error.message; }
+  }
+  const quote = state.applicationFxQuote;
+  const quoteText = quote
+    ? `1 ${currencyCode} = ${number(quote.rate, 6)} USD (${quote.rate_date ? `rate published ${quote.rate_date}` : 'identity conversion'}; ${quote.source}). Original amounts remain in ${currencyCode}.`
+    : `${state.applicationFxQuoteError || 'A dated USD conversion quote is required before this application can be submitted.'}`;
   byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">${edit ? 'APPLICANT RESPONSE' : 'APPLICANT WORKFLOW'}</div><h2>${edit ? 'Provide the requested information' : 'New loan application'}</h2><p>${edit ? 'Update the financial inputs and send the application back for review.' : 'Enter the application and credit-profile fields supported by the historical data.'}</p></div>${!edit ? '<span class="demo-chip">DEMO VALUES AVAILABLE</span>' : ''}</div>
-    <div class="callout warning" style="margin-bottom:15px"><strong>Data scope.</strong> The model was trained on 891 completed loans from one December 2015 LendingClub cohort. Credit-profile fields here are demonstration inputs; a real institution would validate them against authorized records.</div>
-    <div class="callout" style="margin-bottom:15px"><strong>Confirmed market and currency:</strong> ${escapeHtml(countryCode)} · ${escapeHtml(currencyCode)}. Amounts entered below keep this currency when the application is reviewed or edited.</div>
+    <div class="callout warning" style="margin-bottom:15px"><strong>Data scope.</strong> The model was trained on 891 completed US loans from one December 2015 LendingClub cohort. Credit-profile fields here are demonstration inputs; a real institution would validate them against authorized records. Currency conversion only changes monetary units; it does not validate this model for another country's credit market.</div>
+    <div class="callout" style="margin-bottom:15px"><strong>Application market:</strong> ${escapeHtml(countryCode)}. <strong>Input currency:</strong> ${escapeHtml(currencyCode)}. ${escapeHtml(quoteText)} Model monetary inputs are converted to USD before scoring.</div>
     ${!edit ? '<div class="page-actions" style="margin-bottom:13px"><button class="button button-outline button-small" type="button" data-action="fill-demo">Fill example values</button><span class="field-hint">Example values only; they are not a labeled risk outcome.</span></div>' : ''}
     <form id="application-form" data-edit-id="${escapeHtml(state.applicationId || '')}">
-      <input type="hidden" name="country_code" value="${escapeHtml(countryCode)}"><input type="hidden" name="currency_code" value="${escapeHtml(currencyCode)}">
+      <input type="hidden" name="country_code" value="${escapeHtml(countryCode)}"><input type="hidden" name="currency_code" value="${escapeHtml(currencyCode)}"><input type="hidden" name="fx_quote_id" value="${escapeHtml(quote?.id || '')}">
       <section class="form-card"><div class="form-section-head"><strong>Loan request</strong><span>Requested terms</span></div><div class="form-section-body"><div class="field-grid">${applicationFields.slice(0, 2).map((field) => fieldHtml(field, values[field.name], currencyCode)).join('')}${fieldHtml(applicationFields[5], values.purpose, currencyCode)}</div></div></section>
       <section class="form-card"><div class="form-section-head"><strong>Income &amp; credit profile</strong><span>Fields represented in the dataset</span></div><div class="form-section-body"><div class="field-grid">${applicationFields.slice(2, 5).map((field) => fieldHtml(field, values[field.name], currencyCode)).join('')}${applicationFields.slice(6).map((field) => fieldHtml(field, values[field.name], currencyCode)).join('')}</div></div></section>
-      <div class="form-foot"><small>Assessment is a probability estimate. It does not automatically approve or reject a loan. Fields not present in the training data are not requested.</small><button class="button button-primary" type="submit">${edit ? 'Resubmit for review' : 'Submit application'} <span aria-hidden="true">→</span></button></div>
+      <label class="regional-confirm"><input type="checkbox" name="currency_confirmed" value="yes" required><span>I confirm that the monetary values above are entered in ${escapeHtml(currencyCode)}. The model will score the converted USD values shown by the saved rate.</span></label>
+      <div class="form-foot"><small>Assessment is a probability estimate. It does not automatically approve or reject a loan. Fields not present in the training data are not requested.</small><button class="button button-primary" type="submit" ${quote ? '' : 'disabled'}>${edit ? 'Resubmit for review' : 'Submit application'} <span aria-hidden="true">→</span></button></div>
     </form>`;
 }
 
@@ -394,7 +431,9 @@ async function renderApplicationDetail(id) {
   const staff = state.user.role !== 'APPLICANT';
   const prediction = item.prediction;
   const risk = prediction?.risk_category || '';
-  const warningBlock = prediction?.range_warnings?.length ? `<div class="callout warning" style="margin-top:12px"><strong>Outside training range.</strong> ${prediction.range_warnings.map((warning) => `${escapeHtml(warning.label)} ${escapeHtml(monetaryFeatureValue(warning.feature, warning.submitted_value, item.currency_code))} is outside ${escapeHtml(monetaryFeatureValue(warning.feature, warning.observed_minimum, item.currency_code))}–${escapeHtml(monetaryFeatureValue(warning.feature, warning.observed_maximum, item.currency_code))}. Treat this estimate cautiously.`).join('<br>')}</div>` : '';
+  const warningBlock = prediction?.range_warnings?.length ? `<div class="callout warning" style="margin-top:12px"><strong>Outside training range.</strong> ${prediction.range_warnings.map((warning) => `${escapeHtml(warning.label)} ${escapeHtml(monetaryFeatureValue(warning.feature, warning.submitted_value, 'USD'))} is outside ${escapeHtml(monetaryFeatureValue(warning.feature, warning.observed_minimum, 'USD'))}–${escapeHtml(monetaryFeatureValue(warning.feature, warning.observed_maximum, 'USD'))}. Treat this estimate cautiously.`).join('<br>')}</div>` : '';
+  const conversion = prediction?.fx_conversion || item.application_data.fx_conversion;
+  const conversionBlock = conversion ? `<div class="callout" style="margin:12px 0"><strong>Model input conversion:</strong> ${escapeHtml(conversion.input_currency_code)} to USD at ${number(conversion.usd_per_input_unit, 6)} USD per ${escapeHtml(conversion.input_currency_code)}; ${conversion.rate_date ? `published ${escapeHtml(conversion.rate_date)}` : 'identity conversion'}; ${escapeHtml(conversion.rate_source)}. Original amounts remain in ${escapeHtml(item.currency_code)}.</div>` : '';
   const applicantResponse = !staff && item.status === 'NEEDS_MORE_INFORMATION';
   const canReassess = staff && ['AI_ASSESSED', 'UNDER_REVIEW'].includes(item.status);
   const reassessButton = canReassess ? `<button type="button" class="button button-outline" data-action="reassess" data-id="${escapeHtml(item.id)}">New assessment</button>` : '';
@@ -412,7 +451,7 @@ async function renderApplicationDetail(id) {
   const history = (item.prediction_history || []).length > 1 ? `<section class="panel"><div class="panel-head"><div><div class="panel-title">Prediction history</div><div class="panel-subtitle">Each assessment is retained with its model version and risk bands</div></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Date</th><th>Model version</th><th>Probability</th><th>Risk bands</th><th>Risk</th></tr></thead><tbody>${item.prediction_history.map((entry)=>`<tr><td>${dateText(entry.created_at,true)}</td><td>${escapeHtml(entry.model_version)}</td><td>${percent(entry.probability_of_default)}</td><td>${entry.thresholds ? `≤${number(entry.thresholds.low_risk_maximum*100,0)}% / ≤${number(entry.thresholds.medium_risk_maximum*100,0)}%` : 'Unknown'}</td><td>${riskBadge(entry.risk_category)}</td></tr>`).join('')}</tbody></table></div></section>` : '';
   const timeline = item.timeline ? `<section class="panel"><div class="panel-head"><div><div class="panel-title">Application history</div><div class="panel-subtitle">Recorded actions</div></div></div><div class="panel-body">${timelineHtml(item.timeline)}</div></section>` : '';
   byId('page').innerHTML = `<div class="detail-header"><div><button class="text-button" data-action="nav" data-page="applications">← Back to applications</button><div class="detail-id" style="margin-top:9px">Application ${escapeHtml(item.id.slice(0, 8).toUpperCase())}</div><div class="detail-meta">Submitted ${dateText(item.created_at, true)} · ${statusBadge(item.status)}${item.decision ? ` · Decision: ${escapeHtml(statusLabel(item.decision))}` : ''}</div></div><div class="detail-actions"><a class="button button-outline" href="/api/reports/applications/${encodeURIComponent(item.id)}.pdf">Download PDF</a>${actions}</div></div>
-    ${applicantStatus}${assessment}${warningBlock}
+    ${applicantStatus}${assessment}${conversionBlock}${warningBlock}
     <div class="detail-grid" style="margin-top:15px"><div style="display:grid;gap:15px">${ownerCard}${factorsBlock}${notePanel}</div><div style="display:grid;align-content:start;gap:15px"><section class="panel"><div class="panel-head"><div><div class="panel-title">Human review</div><div class="panel-subtitle">Final outcome remains with authorized staff</div></div></div><div class="panel-body">${item.decision ? `<div class="detail-field"><small>Recorded decision</small><strong>${escapeHtml(statusLabel(item.decision))}</strong></div><div class="detail-field" style="margin-top:13px"><small>Decision date</small><strong>${dateText(item.decision_at, true)}</strong></div>` : `<div class="callout">${staff ? 'Review the application details, consider the risk estimate, and record your own decision.' : 'The risk estimate supports a human review. It does not automatically approve or reject an application.'}</div>`}</div></section>${history}${timeline}</div></div>
     <div class="callout important" style="margin-top:15px">${staff ? 'Model explanations describe association with the estimated probability, not cause. A high-risk estimate must not be used as an automatic rejection.' : 'This assessment is generated by a machine-learning model and supports—not replaces—human credit decisions.'}</div>`;
 }
@@ -431,7 +470,7 @@ async function renderModel() {
   byId('model-footer').textContent = `${metadata.algorithm} · ${metadata.model_version}`;
   byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">MODEL CARD &amp; MONITORING</div><h2>Model &amp; governance</h2><p>Metrics from the actual supplied data and the selected model artifact.</p></div>${state.user.role === 'ADMIN' ? '<button class="button button-primary" data-action="retrain">↻ Retrain from bundled dataset</button>' : ''}</div>
     <div class="callout warning" style="margin-bottom:15px"><strong>Scope limitation.</strong> ${metadata.dataset.rows_after_duplicate_id_removal} source rows, ${metadata.dataset.mature_rows_used} completed individual outcomes, ${metadata.dataset.unresolved_rows_excluded} unresolved individual loans, and ${metadata.dataset.joint_or_other_rows_excluded} joint/other applications excluded. The source has ${escapeHtml((metadata.dataset.issue_months || []).join(', ') || 'one recorded issue month')} only. Holdout metrics are illustrative for this cohort and do not establish performance on new years, lenders, or applicants; model probabilities are not calibrated for real lending.</div>
-    <div class="callout warning" style="margin-bottom:15px"><strong>Financial-unit scope.</strong> ${escapeHtml(metadata.financial_units?.application_market || 'United States')} market / ${escapeHtml(metadata.financial_units?.reference_currency || 'USD')} only. The model uses raw USD monetary features and performs no currency conversion.</div><div class="metrics-grid">${metricCard('Active algorithm', metadata.algorithm, '⌁', metadata.model_version)}${metricCard('Mature training records', number(metadata.dataset.mature_rows_used), '▦', `${number(outcomeCounts['Charged Off'])} charged off · ${number(outcomeCounts['Fully Paid'])} fully paid`, 'metric-blue')}${metricCard('Held-out ROC-AUC', number(metrics.roc_auc * 100,1) + '%', '↗', 'Stratified test split · random state 42')}${metricCard('Held-out PR-AUC', number(metrics.pr_auc * 100,1) + '%', '◉', 'Average precision for default class', 'metric-amber')}${metricCard('Precision', number(metrics.precision * 100,1) + '%', '✓', 'At 0.5 classification threshold')}${metricCard('Default recall', number(metrics.recall * 100,1) + '%', '!', 'At 0.5 classification threshold', 'metric-red')}${metricCard('Predictions recorded', number(result.prediction_count), '⌁', 'Immutable prediction history')}${metricCard('Features used', number(metadata.features.length), '▤', `Trained ${dateText(metadata.trained_at)}`, 'metric-blue')}</div>
+    <div class="callout warning" style="margin-bottom:15px"><strong>Financial-unit scope.</strong> ${escapeHtml(metadata.financial_units?.application_market || 'United States')} market / ${escapeHtml(metadata.financial_units?.reference_currency || 'USD')} only. The model receives USD monetary features. Non-USD inputs use a dated reference rate; this does not add support for non-US credit markets.</div><div class="metrics-grid">${metricCard('Active algorithm', metadata.algorithm, '⌁', metadata.model_version)}${metricCard('Mature training records', number(metadata.dataset.mature_rows_used), '▦', `${number(outcomeCounts['Charged Off'])} charged off · ${number(outcomeCounts['Fully Paid'])} fully paid`, 'metric-blue')}${metricCard('Held-out ROC-AUC', number(metrics.roc_auc * 100,1) + '%', '↗', 'Stratified test split · random state 42')}${metricCard('Held-out PR-AUC', number(metrics.pr_auc * 100,1) + '%', '◉', 'Average precision for default class', 'metric-amber')}${metricCard('Precision', number(metrics.precision * 100,1) + '%', '✓', 'At 0.5 classification threshold')}${metricCard('Default recall', number(metrics.recall * 100,1) + '%', '!', 'At 0.5 classification threshold', 'metric-red')}${metricCard('Predictions recorded', number(result.prediction_count), '⌁', 'Immutable prediction history')}${metricCard('Features used', number(metadata.features.length), '▤', `Trained ${dateText(metadata.trained_at)}`, 'metric-blue')}</div>
     <div class="content-grid"><section class="panel"><div class="panel-head"><div><div class="panel-title">Validation comparison</div><div class="panel-subtitle">Candidate models compared before tuning the selected candidate</div></div><span class="role-badge">Selected: ${escapeHtml(metadata.algorithm)}</span></div><div class="table-wrap"><table class="metrics-table"><thead><tr><th>Candidate</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1</th><th>ROC-AUC</th><th>PR-AUC</th></tr></thead><tbody>${comparisonRows}</tbody></table></div><div class="panel-body"><div class="field-hint">Selection rule: highest validation PR-AUC; ties use default recall, then ROC-AUC. Hyperparameters were tuned with three-fold cross-validation on the training portion. Metrics above are validation results; cards show the untouched test set.</div></div></section>
     <section class="panel"><div class="panel-head"><div><div class="panel-title">Held-out test confusion matrix</div><div class="panel-subtitle">Threshold ${metrics.classification_threshold} on the positive class</div></div></div><div class="panel-body"><table class="metrics-table"><thead><tr><th></th><th>Predicted paid</th><th>Predicted charged off</th></tr></thead><tbody><tr><td>Actual paid</td><td>${metrics.confusion_matrix.true_negative}</td><td>${metrics.confusion_matrix.false_positive}</td></tr><tr><td>Actual charged off</td><td>${metrics.confusion_matrix.false_negative}</td><td>${metrics.confusion_matrix.true_positive}</td></tr></tbody></table><div class="field-hint" style="margin-top:9px">Default probability is shown separately from this 0.5 binary threshold and from the configurable risk bands.</div></div></section></div>
     <div class="content-grid"><section class="panel"><div class="panel-head"><div><div class="panel-title">Permutation importance</div><div class="panel-subtitle">Change in held-out average precision when each feature is shuffled</div></div></div><div class="panel-body chart-bars">${importanceRows}</div></section><section class="panel"><div class="panel-head"><div><div class="panel-title">Training pipeline</div><div class="panel-subtitle">Reproducible preprocessing and model selection</div></div></div><div class="panel-body"><div class="timeline">${[['Raw cohort', `${metadata.dataset.rows_after_duplicate_id_removal} unique LendingClub records`],['Outcome filter', `${metadata.dataset.mature_rows_used} completed loans · Current and late accounts excluded`],['Preprocess', 'Median/mode imputation · one-hot categories · scaled numeric fields'],['Compare', 'Logistic regression · decision tree · random forest · SVM'],['Select & tune', 'Validation PR-AUC · 3-fold randomized search'],['Evaluate', `${metadata.split.held_out_test_rows} untouched stratified test records`]].map(([title,detail])=>`<div class="timeline-item"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small></div>`).join('')}</div></div></section></div>
@@ -511,6 +550,8 @@ function demoValues() {
 document.addEventListener('submit', async (event) => {
   const form = event.target;
   if (!(form instanceof HTMLFormElement)) return;
+  const submitButton = form.querySelector('button[type="submit"]');
+  const originalButtonHtml = submitButton?.innerHTML;
   event.preventDefault();
   clearNotice('auth-message');
   clearNotice();
@@ -522,11 +563,15 @@ document.addEventListener('submit', async (event) => {
       const result = await api('/api/auth/register', { method: 'POST', body: JSON.stringify(formObject(form)) });
       state.user = result.user; state.page = 'dashboard'; showWorkspace();
     } else if (form.id === 'regional-form') {
-      const choice = form.elements.namedItem('currency_choice').value;
-      const market = state.regionalOptions.supported_markets.find((entry) => choice === `${entry.currency_code} — ${entry.currency_name} — ${entry.country_name} — ${entry.currency_symbol}`);
+      const currencyCode = form.elements.namedItem('currency_code').value;
+      const currency = state.regionalOptions.supported_currencies.find((entry) => entry.currency_code === currencyCode);
+      const quote = state.applicationFxQuote;
       const countryCode = form.elements.namedItem('country_code').value;
-      if (!market || market.country_code !== countryCode) throw new Error('Choose one of the supported country and currency combinations.');
-      const result = await api('/api/preferences/regional', { method: 'PUT', body: JSON.stringify({ country_code: countryCode, currency_code: market.currency_code, locale_code: form.elements.namedItem('locale_code').value }) });
+      const market = state.regionalOptions.supported_markets.find((entry) => entry.country_code === countryCode);
+      if (!market || !currency || !market.supported_input_currencies.includes(currencyCode)) throw new Error('Choose a supported application market and input currency.');
+      if (!form.elements.namedItem('currency_confirmed').checked) throw new Error('Confirm the currency denomination before continuing.');
+      if (!quote || quote.currency_code !== currencyCode || !quote.id) throw new Error('The currency quote is not ready. Refresh it and try again.');
+      const result = await api('/api/preferences/regional', { method: 'PUT', body: JSON.stringify({ country_code: countryCode, currency_code: currencyCode, locale_code: form.elements.namedItem('locale_code').value }) });
       state.user = result.user;
       state.applicationSetupConfirmed = true;
       state.page = 'new-application';
@@ -536,7 +581,7 @@ document.addEventListener('submit', async (event) => {
     } else if (form.id === 'application-form') {
       state.busy = true;
       const button = form.querySelector('button[type="submit"]'); button.disabled = true; button.innerHTML = '<span class="spinner"></span> Assessing…';
-      const data = formObject(form); const id = form.dataset.editId;
+      const data = formObject(form); data.currency_confirmed = form.elements.namedItem('currency_confirmed').checked; const id = form.dataset.editId;
       const result = await api(id ? `/api/applications/${encodeURIComponent(id)}/information` : '/api/applications', { method: id ? 'PUT' : 'POST', body: JSON.stringify(data) });
       state.page = 'application-detail'; state.applicationId = result.id; await renderPage(); showNotice(id ? 'Updated information and assessment submitted.' : 'Application submitted and assessed.', 'success');
     } else if (form.id === 'threshold-form') {
@@ -545,7 +590,13 @@ document.addEventListener('submit', async (event) => {
   } catch (error) {
     if (form.id === 'login-form' || form.id === 'register-form') showNotice(error.message, 'error', 'auth-message');
     else showNotice(error.message, 'error');
-  } finally { state.busy = false; }
+  } finally {
+    state.busy = false;
+    if (form.id === 'application-form' && submitButton?.isConnected) {
+      submitButton.disabled = false;
+      submitButton.innerHTML = originalButtonHtml;
+    }
+  }
 });
 
 document.addEventListener('click', async (event) => {
@@ -616,7 +667,7 @@ document.addEventListener('click', async (event) => {
       state.applicationId = item.id;
       state.applicationEditing = true;
       state.applicationEditingValues = { ...item.application_data, country_code: item.country_code, currency_code: item.currency_code };
-      state.page = 'new-application'; setPageHeader(); renderApplicationForm(state.applicationEditingValues); return;
+      state.page = 'new-application'; setPageHeader(); await renderApplicationForm(state.applicationEditingValues); return;
     }
     if (name === 'retrain') {
       confirmModal('Retrain the active model?', 'A new artifact will be trained from the bundled historical CSV. Previous prediction records will remain unchanged.', 'confirm-retrain', '', ''); return;

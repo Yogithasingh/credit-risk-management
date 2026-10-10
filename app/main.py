@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +28,11 @@ from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from app import database
+from app import fx
 from app import regional
 from app.schemas import (
     ApplicationInput,
+    CurrencyQuoteInput,
     DecisionInput,
     LoginInput,
     RegisterInput,
@@ -56,6 +58,7 @@ RATE_LIMITS: dict[str, tuple[int, int]] = {
     "/api/auth/login": (10, 60),
     "/api/auth/register": (5, 60),
     "/api/applications": (20, 60),
+    "/api/currency-quotes": (30, 60),
 }
 _request_times: defaultdict[str, deque[float]] = defaultdict(deque)
 _rate_lock = asyncio.Lock()
@@ -198,13 +201,53 @@ def _set_session(response: Response, user: dict[str, Any], request: Request) -> 
 
 
 def _feature_payload(payload: ApplicationInput) -> dict[str, Any]:
-    return payload.model_dump(exclude={"country_code", "currency_code"})
+    return payload.model_dump(exclude={"country_code", "currency_code", "fx_quote_id", "currency_confirmed"})
+
+
+def _require_currency_confirmation(payload: ApplicationInput) -> None:
+    if not payload.currency_confirmed:
+        raise HTTPException(status_code=422, detail="Confirm that all monetary amounts are entered in the selected currency.")
+
+
+def _quote_for_application(payload: ApplicationInput, user: dict[str, Any]) -> dict[str, Any]:
+    if payload.currency_code == "USD" and not payload.fx_quote_id:
+        return {**fx.fetch_usd_rate("USD"), "quoted_at": database.utc_now(), "id": None}
+    if not payload.fx_quote_id:
+        raise HTTPException(status_code=422, detail="Refresh the currency quote before submitting this application.")
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT * FROM currency_quotes WHERE id=? AND user_id=?",
+            (payload.fx_quote_id, user["id"]),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=422, detail="The currency quote is missing or belongs to another account. Refresh it and try again.")
+    if row["currency_code"] != payload.currency_code:
+        raise HTTPException(status_code=422, detail="The currency quote does not match the selected currency. Refresh the quote and try again.")
+    now = datetime.now(timezone.utc)
+    expires_at = datetime.fromisoformat(row["expires_at"])
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= now:
+        raise HTTPException(status_code=409, detail="The currency quote has expired. Refresh the quote before submitting.")
+    try:
+        return {
+            "id": row["id"],
+            "currency_code": row["currency_code"],
+            "reference_currency": row["reference_currency"],
+            "rate": float(row["rate"]),
+            "rate_date": row["rate_date"],
+            "source": row["source"],
+            "quoted_at": row["quoted_at"],
+        }
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="The saved currency quote is invalid. Refresh the quote and try again.")
 
 
 def _create_prediction(
     db,
     application_id: str,
     features: dict[str, Any],
+    fx_conversion: dict[str, Any],
     actor: dict[str, Any],
 ) -> tuple[str, dict[str, Any]]:
     model_result = model_service.predict(features)
@@ -214,8 +257,8 @@ def _create_prediction(
     prediction_id = str(uuid.uuid4())
     created_at = database.utc_now()
     db.execute(
-        """INSERT INTO predictions(id,application_id,model_version,probability_of_default,risk_score,risk_category,thresholds,factors,range_warnings,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO predictions(id,application_id,model_version,probability_of_default,risk_score,risk_category,thresholds,factors,range_warnings,fx_conversion,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (
             prediction_id,
             application_id,
@@ -226,6 +269,7 @@ def _create_prediction(
             json.dumps(thresholds, separators=(",", ":")),
             json.dumps(model_result["factors"], separators=(",", ":")),
             json.dumps(model_result["range_warnings"], separators=(",", ":")),
+            json.dumps(fx_conversion, separators=(",", ":")),
             created_at,
         ),
     )
@@ -250,8 +294,29 @@ def _create_prediction(
         "thresholds": thresholds,
         "factors": model_result["factors"],
         "range_warnings": model_result["range_warnings"],
+        "fx_conversion": fx_conversion,
         "created_at": created_at,
     }
+
+
+def _stored_conversion(values: dict[str, Any], currency_code: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    saved = values.get("fx_conversion")
+    if saved:
+        quote = {
+            "currency_code": saved.get("input_currency_code", currency_code),
+            "reference_currency": "USD",
+            "rate": saved.get("usd_per_input_unit", 1),
+            "rate_date": saved.get("rate_date"),
+            "source": saved.get("rate_source", "Identity conversion (USD to USD)"),
+            "quoted_at": saved.get("quoted_at"),
+            "id": saved.get("quote_id"),
+        }
+    else:
+        quote = {**fx.fetch_usd_rate("USD"), "quoted_at": database.utc_now(), "id": None}
+    clean_features = {key: value for key, value in values.items() if key != "fx_conversion"}
+    normalized, snapshot = fx.normalize_features(clean_features, quote)
+    snapshot["quote_id"] = quote.get("id")
+    return normalized, snapshot
 
 
 def _get_application(db, application_id: str):
@@ -345,6 +410,25 @@ def health():
 @app.get("/api/config/regional")
 def regional_configuration():
     return regional.options_public()
+
+
+@app.post("/api/currency-quotes")
+def create_currency_quote(payload: CurrencyQuoteInput, user: dict[str, Any] = Depends(_current_user)):
+    try:
+        quote = fx.fetch_usd_rate(payload.currency_code)
+    except fx.FXRateUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    quote_id = str(uuid.uuid4())
+    quoted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat(timespec="seconds")
+    with database.connect() as db:
+        db.execute("DELETE FROM currency_quotes WHERE expires_at<?", (quoted_at,))
+        db.execute(
+            """INSERT INTO currency_quotes(id,user_id,currency_code,reference_currency,rate,rate_date,source,quoted_at,expires_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (quote_id, user["id"], quote["currency_code"], quote["reference_currency"], quote["rate"], quote["rate_date"], quote["source"], quoted_at, expires_at),
+        )
+    return {"id": quote_id, **quote, "quoted_at": quoted_at, "expires_at": expires_at}
 
 
 @app.put("/api/preferences/regional")
@@ -577,17 +661,22 @@ def list_applications(
 def create_application(payload: ApplicationInput, user: dict[str, Any] = Depends(_current_user)):
     if user["role"] != "APPLICANT":
         raise HTTPException(status_code=403, detail="Only applicant accounts can submit an application.")
+    _require_currency_confirmation(payload)
+    quote = _quote_for_application(payload, user)
     application_id = str(uuid.uuid4())
     now = database.utc_now()
     values = _feature_payload(payload)
+    model_values, conversion = fx.normalize_features(values, quote)
+    conversion["quote_id"] = quote.get("id")
+    values["fx_conversion"] = conversion
     with database.connect() as db:
         db.execute(
             """INSERT INTO applications(id,applicant_id,status,applicant_name,application_data,created_at,updated_at,status_updated_at,country_code,currency_code)
                VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (application_id, user["id"], "AI_ASSESSED", user["full_name"], json.dumps(values, separators=(",", ":")), now, now, now, payload.country_code, payload.currency_code),
         )
-        _prediction_id, prediction = _create_prediction(db, application_id, values, user)
-        database.audit(db, user, "APPLICATION_SUBMITTED", "application", application_id, {"status": "AI_ASSESSED", "country_code": payload.country_code, "currency_code": payload.currency_code})
+        _prediction_id, prediction = _create_prediction(db, application_id, model_values, conversion, user)
+        database.audit(db, user, "APPLICATION_SUBMITTED", "application", application_id, {"status": "AI_ASSESSED", "country_code": payload.country_code, "currency_code": payload.currency_code, "fx_rate_date": conversion["rate_date"]})
         row = _get_application(db, application_id)
     result = _visible_application(row, user)
     result["prediction"] = prediction
@@ -621,7 +710,8 @@ def reassess_application(application_id: str, user: dict[str, Any] = Depends(_cu
         if row["status"] not in {"AI_ASSESSED", "UNDER_REVIEW"}:
             raise HTTPException(status_code=409, detail="This application is not available for a new assessment in its current state.")
         values = json.loads(row["application_data"])
-        _prediction_id, prediction = _create_prediction(db, application_id, values, user)
+        model_values, conversion = _stored_conversion(values, row["currency_code"])
+        _prediction_id, prediction = _create_prediction(db, application_id, model_values, conversion, user)
         database.audit(db, user, "APPLICATION_REASSESSED", "application", application_id, {"model_version": prediction["model_version"]})
         updated = _get_application(db, application_id)
     result = _visible_application(updated, user)
@@ -708,7 +798,12 @@ def record_decision(application_id: str, payload: DecisionInput, user: dict[str,
 def resubmit_information(application_id: str, payload: ApplicationInput, user: dict[str, Any] = Depends(_current_user)):
     if user["role"] != "APPLICANT":
         raise HTTPException(status_code=403, detail="Only the applicant can update requested information.")
+    _require_currency_confirmation(payload)
+    quote = _quote_for_application(payload, user)
     values = _feature_payload(payload)
+    model_values, conversion = fx.normalize_features(values, quote)
+    conversion["quote_id"] = quote.get("id")
+    values["fx_conversion"] = conversion
     with database.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = _get_application(db, application_id)
@@ -726,7 +821,7 @@ def resubmit_information(application_id: str, payload: ApplicationInput, user: d
         )
         if changed.rowcount != 1:
             raise HTTPException(status_code=409, detail="This application is no longer awaiting more information.")
-        _prediction_id, prediction = _create_prediction(db, application_id, values, user)
+        _prediction_id, prediction = _create_prediction(db, application_id, model_values, conversion, user)
         database.audit(db, user, "APPLICANT_INFORMATION_RESUBMITTED", "application", application_id, {"status": "AI_ASSESSED"})
         row = _get_application(db, application_id)
     result = _visible_application(row, user)
@@ -859,13 +954,15 @@ def report_applications(user: dict[str, Any] = Depends(_current_user)):
         database.audit(db, user, "REPORT_EXPORTED", "report", "applications_csv", {"records": len(rows)})
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["application_id", "application_date", "applicant_name", "applicant_email", "country_code", "currency_code", "loan_amount", "loan_term_months", "annual_income", "purpose", "status", "probability_of_default", "risk_score", "risk_category", "low_risk_maximum", "medium_risk_maximum", "model_version", "analyst_decision", "analyst_notes", "decision_at"])
+    writer.writerow(["application_id", "application_date", "applicant_name", "applicant_email", "country_code", "currency_code", "loan_amount", "loan_term_months", "annual_income", "purpose", "status", "probability_of_default", "risk_score", "risk_category", "low_risk_maximum", "medium_risk_maximum", "model_version", "analyst_decision", "analyst_notes", "decision_at", "model_input_currency_code", "usd_per_input_unit", "fx_rate_date", "fx_rate_source", "loan_amount_usd", "annual_income_usd", "revolving_balance_usd"])
     for row in rows:
         app_data = json.loads(row["application_data"])
         item = database.application_public(row)
         prediction = item["prediction"] or {}
         risk_thresholds = prediction.get("thresholds") or {}
-        writer.writerow([_csv_cell(item["id"]), item["created_at"], _csv_cell(item["applicant_name"]), _csv_cell(item["applicant_email"]), item["country_code"], item["currency_code"], app_data.get("loan_amount"), app_data.get("term_months"), app_data.get("annual_income"), app_data.get("purpose"), item["status"], prediction.get("probability_of_default"), prediction.get("risk_score"), prediction.get("risk_category"), risk_thresholds.get("low_risk_maximum"), risk_thresholds.get("medium_risk_maximum"), prediction.get("model_version"), item["decision"], _csv_cell(item["analyst_notes"]), item["decision_at"]])
+        conversion = prediction.get("fx_conversion") or app_data.get("fx_conversion") or {}
+        usd_amounts = conversion.get("model_amounts_usd") or {}
+        writer.writerow([_csv_cell(item["id"]), item["created_at"], _csv_cell(item["applicant_name"]), _csv_cell(item["applicant_email"]), item["country_code"], item["currency_code"], app_data.get("loan_amount"), app_data.get("term_months"), app_data.get("annual_income"), app_data.get("purpose"), item["status"], prediction.get("probability_of_default"), prediction.get("risk_score"), prediction.get("risk_category"), risk_thresholds.get("low_risk_maximum"), risk_thresholds.get("medium_risk_maximum"), prediction.get("model_version"), item["decision"], _csv_cell(item["analyst_notes"]), item["decision_at"], conversion.get("input_currency_code", item["currency_code"]), conversion.get("usd_per_input_unit"), conversion.get("rate_date"), _csv_cell(conversion.get("rate_source")), usd_amounts.get("loan_amount"), usd_amounts.get("annual_income"), usd_amounts.get("revolving_balance")])
     output.seek(0)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=creditguard-applications.csv"})
 
@@ -882,6 +979,7 @@ def report_application_pdf(application_id: str, user: dict[str, Any] = Depends(_
     data = item["application_data"]
     currency_code = item["currency_code"]
     prediction = item["prediction"] or {}
+    conversion = prediction.get("fx_conversion") or data.get("fx_conversion") or {}
     output = io.BytesIO()
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=20, leading=25, textColor=colors.HexColor("#102a43"), alignment=TA_CENTER, spaceAfter=4))
@@ -899,6 +997,10 @@ def report_application_pdf(application_id: str, user: dict[str, Any] = Depends(_
         Paragraph("CrediGuard AI", styles["ReportTitle"]),
         Paragraph("CREDIT RISK ASSESSMENT · DECISION SUPPORT", styles["ReportMeta"]),
         Paragraph("This assessment is a probabilistic model output for human review. It is not a lending decision or a guarantee of repayment.", styles["Disclaimer"]),
+        Paragraph(
+            f"Monetary inputs were entered in {currency_code} and normalized to USD for model scoring at {conversion.get('usd_per_input_unit', 1)} USD per {currency_code}. Rate date: {conversion.get('rate_date') or 'identity conversion'}. Source: {conversion.get('rate_source', 'legacy USD input')}.",
+            styles["Disclaimer"],
+        ),
         Paragraph("Application overview", styles["SectionHeading"]),
     ]
     summary_data = [
@@ -946,7 +1048,7 @@ def report_application_pdf(application_id: str, user: dict[str, Any] = Depends(_
             delta = factor["probability_change"] * 100
             submitted_value = factor.get("value")
             if factor.get("feature") in regional.MODEL_FINANCIAL_SCOPE["monetary_features"] and submitted_value is not None:
-                submitted_value = f"{currency_code} {float(submitted_value):,.2f}"
+                submitted_value = f"USD {float(submitted_value):,.2f}"
             factor_rows.append([paragraph(factor["label"]), paragraph(submitted_value), paragraph(f"{delta:+.1f} percentage points" if abs(delta) >= 0.05 else "Little change")])
         factor_table = Table(factor_rows, colWidths=[2.3 * inch, 1.8 * inch, 2.4 * inch], hAlign="LEFT")
         factor_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f6f8fa")), ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#e5ebef")), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7), ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
@@ -971,12 +1073,14 @@ def report_powerbi(user: dict[str, Any] = Depends(_current_user)):
         database.audit(db, user, "REPORT_EXPORTED", "report", "powerbi_csv", {"records": len(rows)})
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["application_id", "application_date", "country_code", "currency_code", "loan_amount", "loan_term_months", "annual_income", "purpose", "debt_to_income_ratio", "fico_score", "prior_delinquencies", "probability_of_default", "risk_score", "risk_category", "low_risk_maximum", "medium_risk_maximum", "application_status", "final_decision", "actual_default_status", "model_version"])
+    writer.writerow(["application_id", "application_date", "country_code", "currency_code", "loan_amount", "loan_term_months", "annual_income", "purpose", "debt_to_income_ratio", "fico_score", "prior_delinquencies", "probability_of_default", "risk_score", "risk_category", "low_risk_maximum", "medium_risk_maximum", "application_status", "final_decision", "actual_default_status", "model_version", "usd_per_input_unit", "fx_rate_date", "fx_rate_source", "loan_amount_usd", "annual_income_usd", "revolving_balance_usd"])
     for row in rows:
         item = database.application_public(row)
         data = item["application_data"]
         prediction = item["prediction"] or {}
         risk_thresholds = prediction.get("thresholds") or {}
-        writer.writerow([item["id"], item["created_at"], item["country_code"], item["currency_code"], data.get("loan_amount"), data.get("term_months"), data.get("annual_income"), data.get("purpose"), data.get("dti"), data.get("fico_score"), data.get("prior_delinquencies"), prediction.get("probability_of_default"), prediction.get("risk_score"), prediction.get("risk_category"), risk_thresholds.get("low_risk_maximum"), risk_thresholds.get("medium_risk_maximum"), item["status"], item["decision"], "NOT_OBSERVED", prediction.get("model_version")])
+        conversion = prediction.get("fx_conversion") or data.get("fx_conversion") or {}
+        usd_amounts = conversion.get("model_amounts_usd") or {}
+        writer.writerow([item["id"], item["created_at"], item["country_code"], item["currency_code"], data.get("loan_amount"), data.get("term_months"), data.get("annual_income"), data.get("purpose"), data.get("dti"), data.get("fico_score"), data.get("prior_delinquencies"), prediction.get("probability_of_default"), prediction.get("risk_score"), prediction.get("risk_category"), risk_thresholds.get("low_risk_maximum"), risk_thresholds.get("medium_risk_maximum"), item["status"], item["decision"], "NOT_OBSERVED", prediction.get("model_version"), conversion.get("usd_per_input_unit"), conversion.get("rate_date"), _csv_cell(conversion.get("rate_source")), usd_amounts.get("loan_amount"), usd_amounts.get("annual_income"), usd_amounts.get("revolving_balance")])
     output.seek(0)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=creditguard-powerbi.csv"})

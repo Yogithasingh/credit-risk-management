@@ -18,11 +18,12 @@ from fastapi import HTTPException
 
 from app import database
 from app import main
-from app.schemas import ApplicationInput, DecisionInput, RegionalPreferenceInput
+from app.schemas import ApplicationInput, CurrencyQuoteInput, DecisionInput, RegionalPreferenceInput
 from app.security import hash_password
 
 
 APPLICATION = {
+    "currency_confirmed": True,
     "loan_amount": 12000,
     "term_months": 36,
     "annual_income": 72000,
@@ -78,7 +79,7 @@ class ApplicationLifecycleTests(unittest.TestCase):
             db.execute(
                 """INSERT INTO applications(id,applicant_id,status,applicant_name,application_data,latest_prediction_id,created_at,updated_at,status_updated_at)
                    VALUES(?,?,?,?,?,?,?,?,?)""",
-                (application_id, self.applicant["id"], status, self.applicant["full_name"], json.dumps(APPLICATION), prediction_id, now, now, now),
+                (application_id, self.applicant["id"], status, self.applicant["full_name"], json.dumps({key: value for key, value in APPLICATION.items() if key != "currency_confirmed"}), prediction_id, now, now, now),
             )
             if prediction_id:
                 db.execute(
@@ -320,16 +321,91 @@ class ApplicationLifecycleTests(unittest.TestCase):
         self.assertEqual(row["country_code"], "US")
         self.assertEqual(row["currency_code"], "USD")
         self.assertEqual(json.loads(row["application_data"])["loan_amount"], APPLICATION["loan_amount"])
+        self.assertEqual(submitted["prediction"]["fx_conversion"]["model_amounts_usd"]["loan_amount"], APPLICATION["loan_amount"])
 
     def test_unsupported_currency_and_market_are_rejected(self) -> None:
         from pydantic import ValidationError
 
+        self.assertEqual(ApplicationInput(**{**APPLICATION, "currency_code": "INR"}).currency_code, "INR")
         with self.assertRaises(ValidationError):
-            ApplicationInput(**{**APPLICATION, "currency_code": "INR"})
+            ApplicationInput(**{**APPLICATION, "currency_code": "XYZ"})
         with self.assertRaises(ValidationError):
             ApplicationInput(**{**APPLICATION, "country_code": "IN"})
         with self.assertRaises(ValidationError):
-            RegionalPreferenceInput(country_code="US", currency_code="INR", locale_code="en-US")
+            RegionalPreferenceInput(country_code="US", currency_code="XYZ", locale_code="en-US")
+
+    def test_foreign_denominated_amounts_are_saved_and_scored_in_usd(self) -> None:
+        quote_data = {
+            "currency_code": "INR",
+            "reference_currency": "USD",
+            "rate": 0.0125,
+            "rate_date": "2026-10-09",
+            "source": "Test reference rates",
+        }
+        model_result = {"probability_of_default": 0.25, "model_version": "test-v1", "factors": [], "range_warnings": []}
+        with patch.object(main.fx, "fetch_usd_rate", return_value=quote_data):
+            issued_quote = main.create_currency_quote(CurrencyQuoteInput(currency_code="INR"), self.applicant)
+            payload = ApplicationInput(**{
+                **APPLICATION,
+                "currency_code": "INR",
+                "fx_quote_id": issued_quote["id"],
+            })
+            with patch.object(main.model_service, "predict", return_value=model_result) as predict:
+                submitted = main.create_application(payload, self.applicant)
+
+        scored = predict.call_args.args[0]
+        self.assertEqual(scored["loan_amount"], 150.0)
+        self.assertEqual(scored["annual_income"], 900.0)
+        self.assertEqual(scored["revolving_balance"], 106.25)
+        self.assertEqual(submitted["currency_code"], "INR")
+        self.assertEqual(submitted["application_data"]["loan_amount"], APPLICATION["loan_amount"])
+        self.assertEqual(submitted["prediction"]["fx_conversion"]["rate_date"], "2026-10-09")
+        with database.connect() as db:
+            saved = db.execute("SELECT application_data,currency_code FROM applications WHERE id=?", (submitted["id"],)).fetchone()
+        self.assertEqual(saved["currency_code"], "INR")
+        self.assertEqual(json.loads(saved["application_data"])["loan_amount"], APPLICATION["loan_amount"])
+
+    def test_http_quote_and_application_flow_preserves_selected_currency(self) -> None:
+        login_status, login_headers, _ = self._http_request(
+            "POST", "/api/auth/login", {"email": self.applicant["email"], "password": "unit-test-password-long"}
+        )
+        self.assertEqual(login_status, 200)
+        cookie = login_headers["set-cookie"].split(";", 1)[0]
+        with patch.object(main.fx, "fetch_usd_rate", return_value={
+            "currency_code": "GBP", "reference_currency": "USD", "rate": 1.25,
+            "rate_date": "2026-10-09", "source": "Test reference rates",
+        }):
+            quote_status, _, quote = self._http_request("POST", "/api/currency-quotes", {"currency_code": "GBP"}, cookie)
+            self.assertEqual(quote_status, 200)
+            model_result = {"probability_of_default": 0.25, "model_version": "test-v1", "factors": [], "range_warnings": []}
+            with patch.object(main.model_service, "predict", return_value=model_result):
+                body = {**APPLICATION, "currency_code": "GBP", "fx_quote_id": quote["id"]}
+                submit_status, _, submitted = self._http_request("POST", "/api/applications", body, cookie)
+        self.assertEqual(submit_status, 201)
+        self.assertEqual(submitted["currency_code"], "GBP")
+        self.assertEqual(submitted["application_data"]["loan_amount"], APPLICATION["loan_amount"])
+        self.assertEqual(submitted["prediction"]["fx_conversion"]["model_amounts_usd"]["loan_amount"], 15000.0)
+
+    def test_non_us_currency_requires_owned_matching_quote_and_confirmation(self) -> None:
+        payload = ApplicationInput(**{**APPLICATION, "currency_code": "GBP", "fx_quote_id": None})
+        with self.assertRaises(HTTPException) as missing_quote:
+            main.create_application(payload, self.applicant)
+        self.assertEqual(missing_quote.exception.status_code, 422)
+
+        with patch.object(main.fx, "fetch_usd_rate", return_value={
+            "currency_code": "GBP", "reference_currency": "USD", "rate": 1.3,
+            "rate_date": "2026-10-09", "source": "Test reference rates",
+        }):
+            issued_quote = main.create_currency_quote(CurrencyQuoteInput(currency_code="GBP"), self.other_applicant)
+        foreign_quote = ApplicationInput(**{**APPLICATION, "currency_code": "GBP", "fx_quote_id": issued_quote["id"]})
+        with self.assertRaises(HTTPException) as wrong_owner:
+            main.create_application(foreign_quote, self.applicant)
+        self.assertEqual(wrong_owner.exception.status_code, 422)
+
+        unconfirmed = ApplicationInput(**{**APPLICATION, "currency_confirmed": False})
+        with self.assertRaises(HTTPException) as not_confirmed:
+            main.create_application(unconfirmed, self.applicant)
+        self.assertEqual(not_confirmed.exception.status_code, 422)
 
     def test_regional_display_preference_persists_in_account(self) -> None:
         updated = main.update_regional_preferences(
@@ -365,11 +441,13 @@ class ApplicationLifecycleTests(unittest.TestCase):
         self.assertEqual(me_status, 200)
         self.assertEqual(me["user"]["locale_code"], "en-IN")
 
-    def test_regional_configuration_exposes_only_model_supported_currency(self) -> None:
+    def test_regional_configuration_lists_input_currencies_but_keeps_us_market_scope(self) -> None:
         status, _, configuration = self._http_request("GET", "/api/config/regional")
         self.assertEqual(status, 200)
         self.assertEqual([market["currency_code"] for market in configuration["supported_markets"]], ["USD"])
-        self.assertFalse(configuration["model_financial_scope"]["conversion_enabled"])
+        self.assertEqual([item["currency_code"] for item in configuration["supported_currencies"]], ["USD", "INR", "GBP", "EUR"])
+        self.assertTrue(configuration["model_financial_scope"]["conversion_enabled"])
+        self.assertEqual(configuration["model_financial_scope"]["country_code"], "US")
 
     def test_portfolio_averages_remain_separated_by_currency(self) -> None:
         usd_id = self._application()
@@ -460,6 +538,7 @@ class ApplicationLifecycleTests(unittest.TestCase):
         application_id = self._application("UNDER_REVIEW")
         with database.connect() as db:
             db.execute("DROP TABLE notifications")
+            db.execute("ALTER TABLE predictions DROP COLUMN fx_conversion")
             db.execute("ALTER TABLE applications DROP COLUMN status_updated_at")
             db.execute("ALTER TABLE applications DROP COLUMN country_code")
             db.execute("ALTER TABLE applications DROP COLUMN currency_code")

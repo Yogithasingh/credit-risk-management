@@ -88,7 +88,20 @@ def init_database() -> None:
                 thresholds TEXT NOT NULL,
                 factors TEXT NOT NULL,
                 range_warnings TEXT NOT NULL,
+                fx_conversion TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS currency_quotes (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                currency_code TEXT NOT NULL,
+                reference_currency TEXT NOT NULL DEFAULT 'USD',
+                rate REAL NOT NULL,
+                rate_date TEXT,
+                source TEXT NOT NULL,
+                quoted_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS audit_events (
@@ -148,6 +161,8 @@ def init_database() -> None:
         prediction_columns = {row["name"] for row in db.execute("PRAGMA table_info(predictions)").fetchall()}
         if "thresholds" not in prediction_columns:
             db.execute("ALTER TABLE predictions ADD COLUMN thresholds TEXT NOT NULL DEFAULT '{}' ")
+        if "fx_conversion" not in prediction_columns:
+            db.execute("ALTER TABLE predictions ADD COLUMN fx_conversion TEXT NOT NULL DEFAULT '{}' ")
         application_columns = {row["name"] for row in db.execute("PRAGMA table_info(applications)").fetchall()}
         if "status_updated_at" not in application_columns:
             db.execute("ALTER TABLE applications ADD COLUMN status_updated_at TEXT")
@@ -299,6 +314,7 @@ def prediction_public(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any
         "thresholds": json.loads(row["thresholds"]) if "thresholds" in row.keys() and row["thresholds"] != "{}" else None,
         "factors": json.loads(row["factors"]),
         "range_warnings": json.loads(row["range_warnings"]),
+        "fx_conversion": json.loads(row["fx_conversion"]) if "fx_conversion" in row.keys() and row["fx_conversion"] != "{}" else None,
         "created_at": row["created_at"],
     }
 
@@ -321,6 +337,7 @@ def application_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
             "thresholds": json.loads(row["thresholds"]) if "thresholds" in keys and row["thresholds"] != "{}" else None,
             "factors": json.loads(row["factors"] or "[]"),
             "range_warnings": json.loads(row["range_warnings"] or "[]"),
+            "fx_conversion": json.loads(row["fx_conversion"]) if "fx_conversion" in keys and row["fx_conversion"] != "{}" else None,
             "created_at": row["prediction_created_at"],
         }
     return {
@@ -347,7 +364,7 @@ def application_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
 APPLICATION_SELECT = """
 SELECT a.*, u.email AS applicant_email, analyst.full_name AS analyst_name,
        p.id AS prediction_id, p.model_version, p.probability_of_default, p.risk_score,
-       p.risk_category, p.thresholds, p.factors, p.range_warnings, p.created_at AS prediction_created_at
+       p.risk_category, p.thresholds, p.factors, p.range_warnings, p.fx_conversion, p.created_at AS prediction_created_at
 FROM applications a
 JOIN users u ON u.id=a.applicant_id
 LEFT JOIN users analyst ON analyst.id=a.analyst_id
