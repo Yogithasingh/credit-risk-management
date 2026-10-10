@@ -863,6 +863,26 @@ a{
 .field-full{
   grid-column:1/-1
 }
+.regional-confirm{
+  display:flex!important;
+  align-items:flex-start;
+  gap:10px!important;
+  color:#40586a;
+  font-weight:500!important;
+  line-height:1.5
+}
+.regional-confirm input[type="checkbox"]{
+  flex:0 0 auto;
+  width:16px;
+  min-height:16px;
+  height:16px;
+  margin:2px 0 0;
+  padding:0;
+  accent-color:var(--teal)
+}
+.regional-confirm span{
+  font-size:11px
+}
 .form-card{
   background:white;
   border:1px solid var(--line);

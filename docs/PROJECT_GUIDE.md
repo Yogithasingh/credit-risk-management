@@ -53,11 +53,12 @@ In Docker, the Python process writes its database, model artifacts, and generate
 ### Applicant
 
 1. The person registers or signs in through the browser. Public applicant registration can be switched off by the operator.
-2. The browser sends form data to the FastAPI API. `app/schemas.py` checks that required fields, allowed choices, and value limits are valid.
-3. For a new application, FastAPI saves the submitted profile and creates a prediction. The application starts with status `AI_ASSESSED`.
-4. The applicant can see their own applications and their prediction history. The server checks ownership on each detail request; applicant accounts cannot browse another person's application.
-5. If an analyst requests more information, the application changes to `NEEDS_MORE_INFORMATION`. The applicant can update that application, which returns it to `AI_ASSESSED` and creates another prediction record.
-6. When a staff member records approval, rejection, or an information request, the applicant receives a saved in-app notification. The applicant can open it to see the current status; marking it read is saved too.
+2. Before entering money, the applicant confirms the supported application market and currency. Today that is United States / USD only. The browser may suggest a display locale from browser language settings; this is a number/date format preference, not a country lookup. The market choice is not identity or residence verification.
+3. The browser sends form data to the FastAPI API. `app/schemas.py` checks required fields, allowed choices, country/currency codes, and value limits.
+4. For a new application, FastAPI stores the original numeric amounts and the `country_code` / `currency_code` on the application row, then creates a prediction using raw USD model features. No conversion is performed. The application starts with status `AI_ASSESSED`.
+5. The applicant can see their own applications and their prediction history. The server checks ownership on each detail request; applicant accounts cannot browse another person's application. Amounts keep the application's code while the saved display locale controls number and date formatting.
+6. If an analyst requests more information, the application changes to `NEEDS_MORE_INFORMATION`. The applicant can update that application without changing its market or currency, which returns it to `AI_ASSESSED` and creates another prediction record.
+7. When a staff member records approval, rejection, or an information request, the applicant receives a saved in-app notification. The applicant can open it to see the current status; marking it read is saved too.
 
 ### Analyst and administrator
 
@@ -127,8 +128,8 @@ Every prediction stores the model version and the thresholds used at that time. 
 
 | Information | Storage location | What it contains |
 |---|---|---|
-| Accounts | SQLite `users` table | Name, unique email, scrypt password hash, role, active flag, creation time |
-| Applications | SQLite `applications` table | Applicant link, status and last status-change time, submitted financial/profile fields (JSON), assigned analyst, notes, decision, timestamps, pointer to latest prediction |
+| Accounts | SQLite `users` table | Name, unique email, scrypt password hash, role, active flag, creation time, preferred country/currency and display locale |
+| Applications | SQLite `applications` table | Applicant link, status and last status-change time, submitted financial/profile fields (JSON), ISO country and currency codes, assigned analyst, notes, decision, timestamps, pointer to latest prediction |
 | Prediction history | SQLite `predictions` table | Probability, 0–100 score, risk band, threshold snapshot, top factors, range warnings, model version, timestamp |
 | Audit trail | SQLite `audit_events` table | Actor, action, resource, details, timestamp; records logins, reviews, decisions, exports, and administrative changes |
 | Applicant notifications | SQLite `notifications` table | Recipient, related application, applicant-safe message, type, creation time, and read time; each notice is linked to one unique audit event |
@@ -160,6 +161,7 @@ The BI export labels an application's actual repayment result `NOT_OBSERVED`. Th
 | `app/database.py` | SQLite paths and connections; schema and safe table creation for existing databases; bootstrap administrator; audit/notification helpers; risk thresholds; application/prediction queries and public response shapes. |
 | `app/security.py` | Password hashing and verification, session secret creation/loading, and signing/checking the HTTP-only browser session token. |
 | `app/schemas.py` | Input rules for account, application, decision, threshold, and user-management requests. |
+| `app/regional.py` | Declares supported application markets, display locales, and the model's financial-unit scope. |
 | `app/__init__.py` | Marks `app` as a Python package. |
 
 ### Browser interface
@@ -168,7 +170,7 @@ The BI export labels an application's actual repayment result `NOT_OBSERVED`. Th
 |---|---|
 | `app/static/index.html` | Main browser page structure: sign-in/register area and the workspace shell. |
 | `app/static/styles.css` | Layout, colors, responsive behavior, forms, tables, badges, and other interface styling. |
-| `app/static/app.js` | Calls the backend API, manages the signed-in browser state and navigation, builds dashboard/forms/tables/details and the notification inbox, and handles user actions. Decision buttons show loading/error states and refresh the saved application after success. |
+| `app/static/app.js` | Calls the backend API, manages the signed-in browser state and navigation, builds dashboard/forms/tables/details and the notification inbox, formats amounts by saved locale, and handles user actions. Decision buttons show loading/error states and refresh the saved application after success. |
 | `app/static/api-docs.html` | Page shell for the project's API reference. |
 | `app/static/docs.css` | Styles the API reference page. |
 | `app/static/docs.js` | Reads FastAPI's `/openapi.json` definition and displays its endpoint reference. |
@@ -226,6 +228,7 @@ The components used here are open-source or freely available. A server, domain, 
 - `/docs` — local API reference generated from FastAPI's OpenAPI definition.
 - `/openapi.json` — machine-readable API definition.
 - `/api/health` — database and model readiness check.
+- `/api/config/regional` and `/api/preferences/regional` — supported markets/locales and saved regional display preferences.
 - `/api/dashboard/summary` — applicant's own summary or staff portfolio summary.
 - `/api/applications` — applicant history or staff review queue.
 - `/api/notifications` and `/api/notifications/{id}/read` — the signed-in user's own notification inbox and read state.

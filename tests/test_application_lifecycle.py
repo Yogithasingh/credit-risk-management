@@ -18,7 +18,7 @@ from fastapi import HTTPException
 
 from app import database
 from app import main
-from app.schemas import ApplicationInput, DecisionInput
+from app.schemas import ApplicationInput, DecisionInput, RegionalPreferenceInput
 from app.security import hash_password
 
 
@@ -305,6 +305,104 @@ class ApplicationLifecycleTests(unittest.TestCase):
         self.assertIn(("/api/notifications", "GET"), routes)
         self.assertIn(("/api/notifications/{notification_id}/read", "PATCH"), routes)
 
+    def test_application_currency_is_saved_without_changing_model_units(self) -> None:
+        model_result = {"probability_of_default": 0.25, "model_version": "test-v1", "factors": [], "range_warnings": []}
+        with patch.object(main.model_service, "predict", return_value=model_result) as predict:
+            submitted = main.create_application(ApplicationInput(**APPLICATION), self.applicant)
+
+        self.assertEqual(submitted["country_code"], "US")
+        self.assertEqual(submitted["currency_code"], "USD")
+        self.assertEqual(submitted["application_data"]["currency_code"], "USD")
+        self.assertEqual(predict.call_args.args[0]["loan_amount"], APPLICATION["loan_amount"])
+        self.assertNotIn("currency_code", predict.call_args.args[0])
+        with database.connect() as db:
+            row = db.execute("SELECT application_data,country_code,currency_code FROM applications WHERE id=?", (submitted["id"],)).fetchone()
+        self.assertEqual(row["country_code"], "US")
+        self.assertEqual(row["currency_code"], "USD")
+        self.assertEqual(json.loads(row["application_data"])["loan_amount"], APPLICATION["loan_amount"])
+
+    def test_unsupported_currency_and_market_are_rejected(self) -> None:
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError):
+            ApplicationInput(**{**APPLICATION, "currency_code": "INR"})
+        with self.assertRaises(ValidationError):
+            ApplicationInput(**{**APPLICATION, "country_code": "IN"})
+        with self.assertRaises(ValidationError):
+            RegionalPreferenceInput(country_code="US", currency_code="INR", locale_code="en-US")
+
+    def test_regional_display_preference_persists_in_account(self) -> None:
+        updated = main.update_regional_preferences(
+            RegionalPreferenceInput(country_code="US", currency_code="USD", locale_code="de-DE"),
+            self.applicant,
+        )
+        self.assertEqual(updated["user"]["locale_code"], "de-DE")
+        with database.connect() as db:
+            row = db.execute("SELECT country_code,currency_code,locale_code FROM users WHERE id=?", (self.applicant["id"],)).fetchone()
+        self.assertEqual(dict(row), {"country_code": "US", "currency_code": "USD", "locale_code": "de-DE"})
+
+    def test_regional_preferences_survive_a_new_login_session(self) -> None:
+        login_status, login_headers, _ = self._http_request(
+            "POST", "/api/auth/login", {"email": self.applicant["email"], "password": "unit-test-password-long"}
+        )
+        self.assertEqual(login_status, 200)
+        cookie = login_headers["set-cookie"].split(";", 1)[0]
+        update_status, _, updated = self._http_request(
+            "PUT",
+            "/api/preferences/regional",
+            {"country_code": "US", "currency_code": "USD", "locale_code": "en-IN"},
+            cookie,
+        )
+        self.assertEqual(update_status, 200)
+        self.assertEqual(updated["user"]["locale_code"], "en-IN")
+
+        next_login_status, next_login_headers, _ = self._http_request(
+            "POST", "/api/auth/login", {"email": self.applicant["email"], "password": "unit-test-password-long"}
+        )
+        self.assertEqual(next_login_status, 200)
+        next_cookie = next_login_headers["set-cookie"].split(";", 1)[0]
+        me_status, _, me = self._http_request("GET", "/api/auth/me", cookie=next_cookie)
+        self.assertEqual(me_status, 200)
+        self.assertEqual(me["user"]["locale_code"], "en-IN")
+
+    def test_regional_configuration_exposes_only_model_supported_currency(self) -> None:
+        status, _, configuration = self._http_request("GET", "/api/config/regional")
+        self.assertEqual(status, 200)
+        self.assertEqual([market["currency_code"] for market in configuration["supported_markets"]], ["USD"])
+        self.assertFalse(configuration["model_financial_scope"]["conversion_enabled"])
+
+    def test_portfolio_averages_remain_separated_by_currency(self) -> None:
+        usd_id = self._application()
+        other_id = self._application()
+        with database.connect() as db:
+            db.execute("UPDATE applications SET currency_code='INR' WHERE id=?", (other_id,))
+        summary = main.dashboard_summary(self.admin)
+        self.assertIsNone(summary["average_loan_amount"])
+        self.assertEqual(summary["average_loan_amount_by_currency"], [
+            {"currency_code": "INR", "average_loan_amount": APPLICATION["loan_amount"]},
+            {"currency_code": "USD", "average_loan_amount": APPLICATION["loan_amount"]},
+        ])
+        self.assertNotEqual(usd_id, other_id)
+
+    def test_currency_is_present_in_csv_and_pdf_exports(self) -> None:
+        self._application()
+
+        async def response_bytes(response) -> bytes:
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk.encode(response.charset) if isinstance(chunk, str) else chunk)
+            return b"".join(chunks)
+
+        csv_response = main.report_applications(self.admin)
+        csv_body = asyncio.run(response_bytes(csv_response))
+        self.assertIn(b"country_code,currency_code,loan_amount", csv_body)
+        self.assertIn(b"US,USD,12000", csv_body)
+
+        pdf_response = main.report_application_pdf(self._application(), self.admin)
+        pdf_body = asyncio.run(response_bytes(pdf_response))
+        self.assertEqual(pdf_response.media_type, "application/pdf")
+        self.assertTrue(pdf_body.startswith(b"%PDF"))
+
     def test_http_flow_uses_sessions_and_updates_applicant_inbox(self) -> None:
         model_result = {"probability_of_default": 0.25, "model_version": "test-v1", "factors": [], "range_warnings": []}
         with patch.object(main.model_service, "predict", return_value=model_result):
@@ -317,6 +415,8 @@ class ApplicationLifecycleTests(unittest.TestCase):
             applicant_cookie = applicant_headers["set-cookie"].split(";", 1)[0]
             submit_status, _, submitted = self._http_request("POST", "/api/applications", APPLICATION, applicant_cookie)
             self.assertEqual(submit_status, 201)
+            self.assertEqual(submitted["currency_code"], "USD")
+            self.assertEqual(submitted["application_data"]["currency_code"], "USD")
 
         admin_status, admin_headers, _ = self._http_request(
             "POST", "/api/auth/login", {"email": self.admin["email"], "password": "unit-test-password-long"}
@@ -361,14 +461,22 @@ class ApplicationLifecycleTests(unittest.TestCase):
         with database.connect() as db:
             db.execute("DROP TABLE notifications")
             db.execute("ALTER TABLE applications DROP COLUMN status_updated_at")
+            db.execute("ALTER TABLE applications DROP COLUMN country_code")
+            db.execute("ALTER TABLE applications DROP COLUMN currency_code")
+            db.execute("ALTER TABLE users DROP COLUMN country_code")
+            db.execute("ALTER TABLE users DROP COLUMN currency_code")
+            db.execute("ALTER TABLE users DROP COLUMN locale_code")
 
         database.init_database()
         with database.connect() as db:
-            application = db.execute("SELECT status,status_updated_at FROM applications WHERE id=?", (application_id,)).fetchone()
+            application = db.execute("SELECT status,status_updated_at,country_code,currency_code,application_data FROM applications WHERE id=?", (application_id,)).fetchone()
             user_exists = db.execute("SELECT 1 FROM users WHERE id=?", (self.applicant["id"],)).fetchone()
             notification_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='notifications'").fetchone()
         self.assertEqual(application["status"], "UNDER_REVIEW")
         self.assertIsNotNone(application["status_updated_at"])
+        self.assertEqual(application["country_code"], "US")
+        self.assertEqual(application["currency_code"], "USD")
+        self.assertEqual(json.loads(application["application_data"])["loan_amount"], APPLICATION["loan_amount"])
         self.assertIsNotNone(user_exists)
         self.assertIsNotNone(notification_table)
 

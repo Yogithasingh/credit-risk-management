@@ -54,7 +54,10 @@ def init_database() -> None:
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('APPLICANT','ANALYST','ADMIN')),
                 active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                country_code TEXT NOT NULL DEFAULT 'US',
+                currency_code TEXT NOT NULL DEFAULT 'USD',
+                locale_code TEXT
             );
 
             CREATE TABLE IF NOT EXISTS applications (
@@ -70,7 +73,9 @@ def init_database() -> None:
                 decision_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                status_updated_at TEXT
+                status_updated_at TEXT,
+                country_code TEXT NOT NULL DEFAULT 'US',
+                currency_code TEXT NOT NULL DEFAULT 'USD'
             );
 
             CREATE TABLE IF NOT EXISTS predictions (
@@ -146,9 +151,23 @@ def init_database() -> None:
         application_columns = {row["name"] for row in db.execute("PRAGMA table_info(applications)").fetchall()}
         if "status_updated_at" not in application_columns:
             db.execute("ALTER TABLE applications ADD COLUMN status_updated_at TEXT")
+        for column, definition in (
+            ("country_code", "TEXT NOT NULL DEFAULT 'US'"),
+            ("currency_code", "TEXT NOT NULL DEFAULT 'USD'"),
+        ):
+            if column not in application_columns:
+                db.execute(f"ALTER TABLE applications ADD COLUMN {column} {definition}")
         db.execute(
             "UPDATE applications SET status_updated_at=COALESCE(decision_at,updated_at,created_at) WHERE status_updated_at IS NULL"
         )
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
+        for column, definition in (
+            ("country_code", "TEXT NOT NULL DEFAULT 'US'"),
+            ("currency_code", "TEXT NOT NULL DEFAULT 'USD'"),
+            ("locale_code", "TEXT"),
+        ):
+            if column not in user_columns:
+                db.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
 
 
 def ensure_bootstrap_admin() -> None:
@@ -179,6 +198,9 @@ def user_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "role": row["role"],
         "active": bool(row["active"]),
         "created_at": row["created_at"],
+        "country_code": row["country_code"],
+        "currency_code": row["currency_code"],
+        "locale_code": row["locale_code"],
     }
 
 
@@ -283,6 +305,11 @@ def prediction_public(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any
 
 def application_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     keys = row.keys()
+    country_code = row["country_code"] if "country_code" in keys else "US"
+    currency_code = row["currency_code"] if "currency_code" in keys else "USD"
+    application_data = json.loads(row["application_data"])
+    application_data.setdefault("country_code", country_code)
+    application_data.setdefault("currency_code", currency_code)
     prediction = None
     if "prediction_id" in keys and row["prediction_id"]:
         prediction = {
@@ -302,7 +329,9 @@ def application_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "applicant_id": row["applicant_id"],
         "applicant_name": row["applicant_name"],
         "applicant_email": row["applicant_email"] if "applicant_email" in keys else None,
-        "application_data": json.loads(row["application_data"]),
+        "application_data": application_data,
+        "country_code": country_code,
+        "currency_code": currency_code,
         "prediction": prediction,
         "analyst_id": row["analyst_id"],
         "analyst_name": row["analyst_name"] if "analyst_name" in keys else None,

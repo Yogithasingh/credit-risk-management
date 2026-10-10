@@ -37,6 +37,8 @@ The model uses 12 numeric inputs and three categoricals:
 
 `loan_amount`, `term_months`, `annual_income`, `dti`, `prior_delinquencies`, `fico_score`, `recent_credit_inquiries`, `open_accounts`, `public_records`, `revolving_balance`, `revolving_utilization`, `total_accounts`, `home_ownership`, `employment_length`, and `purpose`.
 
+The numeric monetary inputs `loan_amount`, `annual_income`, and `revolving_balance` use the raw USD units of LendingClub's `loan_amnt`, `annual_inc`, and `revol_bal` columns. The feature pipeline does not normalize these amounts or convert currencies. New applications are consequently restricted to the US market and USD; allowing another currency would change the feature meaning and invalidate the model's learned ranges and predictions.
+
 All 15 map to actual columns or transparent transformations in the supplied data. Employment length has 42 missing source rows and is mode-imputed during training; the input is optional in the application form. See the feature map in the README and the model metadata JSON generated on startup.
 
 ## Validation and limitations

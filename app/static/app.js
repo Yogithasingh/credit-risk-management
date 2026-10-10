@@ -1,26 +1,36 @@
-const state = { user: null, page: 'dashboard', applicationPage: 1, applicationPages: 1, auditPage: 1, busy: false };
+const state = { user: null, page: 'dashboard', applicationPage: 1, applicationPages: 1, auditPage: 1, busy: false, regionalOptions: null, applicationSetupConfirmed: false, applicationEditing: false, applicationEditingValues: null };
 const byId = (id) => document.getElementById(id);
+const MONEY_FEATURES = new Set(['loan_amount', 'annual_income', 'revolving_balance']);
+function displayLocale() { return state.user?.locale_code || 'en-US'; }
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 }
-function money(value) {
+function money(value, currencyCode = 'USD') {
   if (value === null || value === undefined || value === '') return '—';
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(Number(value));
+  try {
+    const formatted = new Intl.NumberFormat(displayLocale(), { style: 'currency', currency: currencyCode, maximumFractionDigits: 2 }).format(Number(value));
+    return `${formatted} ${currencyCode}`;
+  } catch {
+    return `${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currencyCode}`;
+  }
 }
 function number(value, digits = 0) {
   if (value === null || value === undefined || value === '') return '—';
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(Number(value));
+  return new Intl.NumberFormat(displayLocale(), { maximumFractionDigits: digits }).format(Number(value));
 }
 function percent(value, digits = 1) {
   if (value === null || value === undefined || value === '') return '—';
-  return `${(Number(value) * 100).toFixed(digits)}%`;
+  return new Intl.NumberFormat(displayLocale(), { style: 'percent', minimumFractionDigits: digits, maximumFractionDigits: digits }).format(Number(value));
 }
 function dateText(value, includeTime = false) {
   if (!value) return '—';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return escapeHtml(value);
-  return new Intl.DateTimeFormat(undefined, includeTime ? { dateStyle: 'medium', timeStyle: 'short' } : { dateStyle: 'medium' }).format(date);
+  return new Intl.DateTimeFormat(displayLocale(), includeTime ? { dateStyle: 'medium', timeStyle: 'short' } : { dateStyle: 'medium' }).format(date);
+}
+function monetaryFeatureValue(feature, value, currencyCode = 'USD') {
+  return MONEY_FEATURES.has(feature) ? money(value, currencyCode) : number(value, 1);
 }
 function titleWords(value) {
   return String(value || '').toLowerCase().split(/[_\s]+/).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
@@ -119,7 +129,7 @@ function showWorkspace() {
   byId('user-name').textContent = state.user.full_name;
   byId('user-role').textContent = roleLabel(state.user.role);
   byId('user-avatar').textContent = state.user.full_name.trim().split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase();
-  byId('topbar-date').textContent = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date());
+  byId('topbar-date').textContent = new Intl.DateTimeFormat(displayLocale(), { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date());
   refreshHealth();
   const pages = rolePages();
   byId('main-nav').innerHTML = pages.map(([key, label, icon]) => `<button class="nav-item ${state.page === key ? 'active' : ''}" type="button" data-action="nav" data-page="${key}"><span class="nav-icon">${icon}</span><span class="nav-label">${label}</span>${key === 'notifications' ? '<span id="notification-count" class="notification-count hidden" aria-label="Unread notifications"></span>' : ''}</button>`).join('');
@@ -145,6 +155,12 @@ function setPageHeader() {
   byId('main-nav').querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.page === state.page));
 }
 function navigate(page, data = {}) {
+  if (page === 'new-application') {
+    state.applicationId = null;
+    state.applicationEditing = false;
+    state.applicationEditingValues = null;
+    state.applicationSetupConfirmed = false;
+  }
   state.page = page;
   if (data.id) state.applicationId = data.id;
   if (page === 'applications') state.applicationPage = 1;
@@ -163,7 +179,11 @@ async function renderPage() {
     if (state.page === 'dashboard') await renderDashboard();
     else if (state.page === 'applications') await renderApplications();
     else if (state.page === 'notifications' && state.user.role === 'APPLICANT') await renderNotifications();
-    else if (state.page === 'new-application') renderApplicationForm();
+    else if (state.page === 'new-application') {
+      if (state.applicationEditing) renderApplicationForm(state.applicationEditingValues);
+      else if (!state.applicationSetupConfirmed) await renderRegionalSetup();
+      else renderApplicationForm();
+    }
     else if (state.page === 'application-detail') await renderApplicationDetail(state.applicationId);
     else if (state.page === 'model') await renderModel();
     else if (state.page === 'users') await renderUsers();
@@ -198,7 +218,7 @@ function applicationRows(items, staff = false) {
   return items.map((item) => `<tr data-action="open-app" data-id="${escapeHtml(item.id)}">
     <td><span class="table-primary">${escapeHtml(item.applicant_name || 'Applicant')}</span><span class="table-secondary">${escapeHtml(item.id.slice(0, 8).toUpperCase())} · Submitted ${dateText(item.created_at)}</span><span class="table-secondary">Status updated ${dateText(item.status_updated_at)}</span></td>
     <td>${staff ? escapeHtml(item.applicant_email || '') : `${number(item.application_data.term_months)} months`}</td>
-    <td>${money(item.application_data.loan_amount)}</td>
+    <td>${money(item.application_data.loan_amount, item.currency_code)}</td>
     <td>${item.prediction ? percent(item.prediction.probability_of_default) : '—'}</td>
     <td>${riskBadge(item.prediction?.risk_category)}</td>
     <td>${statusBadge(item.status)}</td>
@@ -224,7 +244,7 @@ async function renderDashboard() {
   const dist = summary.risk_distribution || {};
   const rate = summary.historical_default_rate;
   byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">PORTFOLIO SNAPSHOT</div><h2>Credit operations overview</h2><p>Application workflow and model assessments from this workspace.</p></div><div class="page-actions"><a class="button button-outline" href="/api/reports/applications.csv">↓ Export applications</a><a class="button button-outline" href="/api/reports/powerbi.csv">↗ BI-ready CSV</a><button class="button button-primary" data-action="nav" data-page="applications">Review queue →</button></div></div>
-    <div class="metrics-grid">${metricCard('Total applications', number(summary.total_applications), '▤', 'All submitted applications')}${metricCard('Pending review', number(summary.pending_review), '◷', 'AI assessed, in review, or awaiting information', 'metric-blue')}${metricCard('Approved', number(summary.approved), '✓', 'Analyst decisions', '')}${metricCard('High risk', number(dist.HIGH || 0), '!', 'Manual review remains required', 'metric-red')}${metricCard('Medium risk', number(dist.MEDIUM || 0), '◉', 'Latest assessment on each application', 'metric-amber')}${metricCard('Low risk', number(dist.LOW || 0), '○', 'Latest assessment on each application', '')}${metricCard('Average loan amount', money(summary.average_loan_amount), '$', 'Submitted applications')}${metricCard('Average risk score', `${number(summary.average_risk_score, 1)} / 100`, '⌁', 'Probability of default × 100', 'metric-blue')}</div>
+    <div class="metrics-grid">${metricCard('Total applications', number(summary.total_applications), '▤', 'All submitted applications')}${metricCard('Pending review', number(summary.pending_review), '◷', 'AI assessed, in review, or awaiting information', 'metric-blue')}${metricCard('Approved', number(summary.approved), '✓', 'Analyst decisions', '')}${metricCard('High risk', number(dist.HIGH || 0), '!', 'Manual review remains required', 'metric-red')}${metricCard('Medium risk', number(dist.MEDIUM || 0), '◉', 'Latest assessment on each application', 'metric-amber')}${metricCard('Low risk', number(dist.LOW || 0), '○', 'Latest assessment on each application', '')}${metricCard('Average loan amount', (summary.average_loan_amount_by_currency || []).map((entry) => money(entry.average_loan_amount, entry.currency_code)).join(' / ') || 'No data', 'C', 'Averages grouped by currency')}${metricCard('Average risk score', `${number(summary.average_risk_score, 1)} / 100`, '⌁', 'Probability of default × 100', 'metric-blue')}</div>
     <div class="content-grid"><section class="panel"><div class="panel-head"><div><div class="panel-title">Risk profile</div><div class="panel-subtitle">Latest estimate per application</div></div><span class="role-badge">${number(summary.total_applications)} total</span></div><div class="panel-body">${chartBars(dist)}</div></section><section class="panel"><div class="panel-head"><div><div class="panel-title">Application volume</div><div class="panel-subtitle">Submitted by month</div></div></div><div class="panel-body">${monthChart(summary.applications_by_month)}</div></section></div>
     <div class="panel"><div class="panel-head"><div><div class="panel-title">Latest applications</div><div class="panel-subtitle">Click a row to open the review and audit history</div></div><button class="button button-outline button-small" data-action="nav" data-page="applications">All applications →</button></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Applicant / reference</th><th>Email</th><th>Loan amount</th><th>Default estimate</th><th>Risk</th><th>Status</th><th></th></tr></thead><tbody>${applicationRows(recent.items, true)}</tbody></table></div></div>
     <div class="callout warning" style="margin-top:15px"><strong>Historical data note.</strong> ${rate === null ? 'Training cohort default share is unavailable.' : `The matured training cohort default share was ${percent(rate)}.`} ${escapeHtml(summary.historical_default_rate_note || '')} It is separate from current application outcomes.</div>`;
@@ -248,14 +268,53 @@ async function renderApplications() {
     <div class="panel"><div class="panel-head"><div><div class="panel-title">${result.total} application${result.total === 1 ? '' : 's'}</div><div class="panel-subtitle">Most recent first</div></div>${controls}</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Applicant / reference</th><th>${staff?'Email':'Term'}</th><th>Loan amount</th><th>Default estimate</th><th>Risk</th><th>Status</th><th></th></tr></thead><tbody>${applicationRows(result.items, staff)}</tbody></table></div><div class="table-pagination"><span>${result.total ? `Page ${result.page} of ${result.pages} · ${result.total} results` : 'No records'}</span><div class="pagination-actions"><button type="button" class="button button-outline button-small" data-action="app-page" data-page-number="${Math.max(1, result.page - 1)}" ${result.page <= 1 ? 'disabled' : ''}>Previous</button><button type="button" class="button button-outline button-small" data-action="app-page" data-page-number="${Math.min(result.pages, result.page + 1)}" ${result.page >= result.pages ? 'disabled' : ''}>Next</button></div></div></div>`;
 }
 
+function browserLocaleSuggestion(locales) {
+  const supported = locales.map((item) => item.locale_code);
+  for (const candidate of navigator.languages || [navigator.language]) {
+    try {
+      const canonical = Intl.getCanonicalLocales(candidate)[0];
+      if (supported.includes(canonical)) return canonical;
+      const language = canonical.split('-')[0].toLowerCase();
+      const match = supported.find((locale) => locale.split('-')[0].toLowerCase() === language);
+      if (match) return match;
+    } catch {}
+  }
+  return 'en-US';
+}
+
+async function renderRegionalSetup() {
+  const options = state.regionalOptions || await api('/api/config/regional');
+  state.regionalOptions = options;
+  const market = options.supported_markets.find((entry) => entry.country_code === (state.user.country_code || 'US')) || options.supported_markets[0];
+  const currencyChoice = `${market.currency_code} — ${market.currency_name} — ${market.country_name} — ${market.currency_symbol}`;
+  const localeCode = state.user.locale_code || browserLocaleSuggestion(options.supported_locales);
+  const countryOptions = [
+    ...options.supported_markets.map((entry) => `<option value="${escapeHtml(entry.country_code)}" selected>${escapeHtml(entry.country_name)} (${escapeHtml(entry.country_code)}) — supported application market</option>`),
+    ...options.unsupported_markets.map((entry) => `<option value="${escapeHtml(entry.country_code)}" disabled>${escapeHtml(entry.country_name)} (${escapeHtml(entry.country_code)}) — ${escapeHtml(entry.currency_code)} not supported by this model</option>`),
+  ].join('');
+  const localeOptions = options.supported_locales.map((entry) => `<option value="${escapeHtml(entry.locale_code)}" ${entry.locale_code === localeCode ? 'selected' : ''}>${escapeHtml(entry.name)} — ${escapeHtml(entry.locale_code)}</option>`).join('');
+  byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">BEFORE YOU APPLY</div><h2>Choose region and currency</h2><p>Confirm the market and denomination before entering any financial amounts.</p></div></div>
+    <section class="panel regional-setup"><div class="panel-head"><div><div class="panel-title">Application settings</div><div class="panel-subtitle">Your choices are saved with your account and copied onto each new application.</div></div></div>
+      <div class="panel-body"><div class="callout warning"><strong>Model support is limited to the United States and USD.</strong> The supplied LendingClub model uses raw USD loan, income, and revolving-balance features. There is no currency conversion. This is the application's lending market selection; it does not establish your residence, nationality, identity, eligibility, or identity-verification jurisdiction.</div>
+        <form id="regional-form" class="field-grid" style="margin-top:16px">
+          <div class="field"><label for="application-country">Country / application market</label><select id="application-country" name="country_code" required>${countryOptions}</select><span class="field-hint">Other markets are listed as unavailable until the model is validated for them.</span></div>
+          <div class="field"><label for="application-currency">Search supported currencies</label><input id="application-currency" name="currency_choice" type="search" list="supported-currencies" value="${escapeHtml(currencyChoice)}" autocomplete="off" required><datalist id="supported-currencies">${options.supported_markets.map((entry) => `<option value="${escapeHtml(`${entry.currency_code} — ${entry.currency_name} — ${entry.country_name} — ${entry.currency_symbol}`)}"></option>`).join('')}</datalist><span class="field-hint">Currency is identified by its ISO 4217 code; the code will appear with monetary amounts.</span></div>
+          <div class="field"><label for="display-locale">Number and date display locale</label><select id="display-locale" name="locale_code" required>${localeOptions}</select><span class="field-hint">A browser-language suggestion is used for display only. The interface remains in English; this does not detect your country.</span></div>
+          <div class="field-full"><label class="regional-confirm"><input type="checkbox" name="currency_confirmed" value="yes" required><span>I confirm that the financial amounts I enter next, including loan amount, annual income, and revolving balance, will be denominated in ${escapeHtml(market.currency_code)}.</span></label></div>
+          <div class="field-full form-foot"><small>Country/market, currency, locale, and identity verification are separate. Currency selection is not proof of identity or residence.</small><button class="button button-primary" type="submit">Confirm and continue</button></div>
+        </form>
+      </div>
+    </section>`;
+}
+
 const purposeOptions = [
   ['debt_consolidation', 'Debt consolidation'], ['credit_card', 'Credit card'], ['home_improvement', 'Home improvement'], ['other', 'Other'],
   ['major_purchase', 'Major purchase'], ['car', 'Car'], ['small_business', 'Small business'], ['house', 'House'], ['moving', 'Moving'], ['vacation', 'Vacation'], ['medical', 'Medical'],
 ];
 const applicationFields = [
-  { name: 'loan_amount', label: 'Requested loan amount', type: 'number', min: 1, max: 1000000, step: 100, hint: 'USD. The historical sample ranges from $1,000 to $35,000.' },
+  { name: 'loan_amount', label: 'Requested loan amount', type: 'number', min: 1, max: 1000000, step: 100, hint: 'Use the confirmed application currency. The historical sample is USD.' },
   { name: 'term_months', label: 'Loan term', type: 'select', options: [[36, '36 months'], [60, '60 months']], hint: 'Only the two terms found in the supplied sample are supported.' },
-  { name: 'annual_income', label: 'Annual income', type: 'number', min: 1, max: 100000000, step: 1000, hint: 'USD, before tax.' },
+  { name: 'annual_income', label: 'Annual income', type: 'number', min: 1, max: 100000000, step: 1000, hint: 'Before tax; use the confirmed application currency.' },
   { name: 'home_ownership', label: 'Home ownership', type: 'select', options: [['MORTGAGE', 'Mortgage'], ['RENT', 'Rent'], ['OWN', 'Own']], hint: 'Categories available in the dataset.' },
   { name: 'employment_length', label: 'Employment length', type: 'select', required: false, options: [['', 'Not provided'], ['< 1 year', 'Less than 1 year'], ['1 year', '1 year'], ['2 years', '2 years'], ['3 years', '3 years'], ['4 years', '4 years'], ['5 years', '5 years'], ['6 years', '6 years'], ['7 years', '7 years'], ['8 years', '8 years'], ['9 years', '9 years'], ['10+ years', '10+ years']], hint: 'Observed categories from the supplied data; optional when unavailable.' },
   { name: 'purpose', label: 'Loan purpose', type: 'select', options: purposeOptions, hint: 'Choose from purposes represented in the dataset.' },
@@ -265,27 +324,33 @@ const applicationFields = [
   { name: 'recent_credit_inquiries', label: 'Recent credit inquiries', type: 'number', min: 0, max: 100, step: 1, hint: 'Credit inquiries in the past six months.' },
   { name: 'open_accounts', label: 'Open credit accounts', type: 'number', min: 0, max: 500, step: 1 },
   { name: 'public_records', label: 'Public records', type: 'number', min: 0, max: 100, step: 1 },
-  { name: 'revolving_balance', label: 'Revolving balance', type: 'number', min: 0, max: 100000000, step: 100, hint: 'USD.' },
+  { name: 'revolving_balance', label: 'Revolving balance', type: 'number', min: 0, max: 100000000, step: 100, hint: 'Use the confirmed application currency.' },
   { name: 'revolving_utilization', label: 'Revolving utilization', type: 'number', min: 0, max: 300, step: 0.1, suffix: '%', hint: 'The supplied sample ranges from 0% to 102.4%.' },
   { name: 'total_accounts', label: 'Total credit accounts', type: 'number', min: 0, max: 1000, step: 1 },
 ];
-function fieldHtml(field, value = '') {
-  const label = `<label>${escapeHtml(field.label)}${field.suffix ? ` (${escapeHtml(field.suffix)})` : ''}${field.hint ? `<span class="field-hint">${escapeHtml(field.hint)}</span>` : ''}`;
+function fieldHtml(field, value = '', currencyCode = 'USD') {
+  const currencyLabel = MONEY_FEATURES.has(field.name) ? ` (${escapeHtml(currencyCode)})` : '';
+  const label = `<label>${escapeHtml(field.label)}${currencyLabel}${field.suffix ? ` (${escapeHtml(field.suffix)})` : ''}${field.hint ? `<span class="field-hint">${escapeHtml(field.hint)}</span>` : ''}`;
   if (field.type === 'select') {
     const options = field.options.map(([optionValue, optionLabel]) => `<option value="${escapeHtml(optionValue)}" ${String(value) === String(optionValue) ? 'selected' : ''}>${escapeHtml(optionLabel)}</option>`).join('');
     return `<div class="field">${label}<select name="${field.name}" ${field.required === false ? '' : 'required'}>${field.required === false ? '' : `<option value="" disabled ${value === '' ? 'selected' : ''}>Select…</option>`}${options}</select></label></div>`;
   }
-  return `<div class="field">${label}<input name="${field.name}" type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${escapeHtml(value)}" required></label></div>`;
+  const placeholder = MONEY_FEATURES.has(field.name) ? ` placeholder="Enter amount in ${escapeHtml(currencyCode)}"` : '';
+  return `<div class="field">${label}<input name="${field.name}" type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${escapeHtml(value)}"${placeholder} required></label></div>`;
 }
 function renderApplicationForm(existing = null) {
   const values = existing || {};
   const edit = Boolean(existing);
+  const countryCode = values.country_code || state.user.country_code || 'US';
+  const currencyCode = values.currency_code || state.user.currency_code || 'USD';
   byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">${edit ? 'APPLICANT RESPONSE' : 'APPLICANT WORKFLOW'}</div><h2>${edit ? 'Provide the requested information' : 'New loan application'}</h2><p>${edit ? 'Update the financial inputs and send the application back for review.' : 'Enter the application and credit-profile fields supported by the historical data.'}</p></div>${!edit ? '<span class="demo-chip">DEMO VALUES AVAILABLE</span>' : ''}</div>
     <div class="callout warning" style="margin-bottom:15px"><strong>Data scope.</strong> The model was trained on 891 completed loans from one December 2015 LendingClub cohort. Credit-profile fields here are demonstration inputs; a real institution would validate them against authorized records.</div>
+    <div class="callout" style="margin-bottom:15px"><strong>Confirmed market and currency:</strong> ${escapeHtml(countryCode)} · ${escapeHtml(currencyCode)}. Amounts entered below keep this currency when the application is reviewed or edited.</div>
     ${!edit ? '<div class="page-actions" style="margin-bottom:13px"><button class="button button-outline button-small" type="button" data-action="fill-demo">Fill example values</button><span class="field-hint">Example values only; they are not a labeled risk outcome.</span></div>' : ''}
     <form id="application-form" data-edit-id="${escapeHtml(state.applicationId || '')}">
-      <section class="form-card"><div class="form-section-head"><strong>Loan request</strong><span>Requested terms</span></div><div class="form-section-body"><div class="field-grid">${applicationFields.slice(0, 2).map((field) => fieldHtml(field, values[field.name])).join('')}${fieldHtml(applicationFields[5], values.purpose)}</div></div></section>
-      <section class="form-card"><div class="form-section-head"><strong>Income &amp; credit profile</strong><span>Fields represented in the dataset</span></div><div class="form-section-body"><div class="field-grid">${applicationFields.slice(2, 5).map((field) => fieldHtml(field, values[field.name])).join('')}${applicationFields.slice(6).map((field) => fieldHtml(field, values[field.name])).join('')}</div></div></section>
+      <input type="hidden" name="country_code" value="${escapeHtml(countryCode)}"><input type="hidden" name="currency_code" value="${escapeHtml(currencyCode)}">
+      <section class="form-card"><div class="form-section-head"><strong>Loan request</strong><span>Requested terms</span></div><div class="form-section-body"><div class="field-grid">${applicationFields.slice(0, 2).map((field) => fieldHtml(field, values[field.name], currencyCode)).join('')}${fieldHtml(applicationFields[5], values.purpose, currencyCode)}</div></div></section>
+      <section class="form-card"><div class="form-section-head"><strong>Income &amp; credit profile</strong><span>Fields represented in the dataset</span></div><div class="form-section-body"><div class="field-grid">${applicationFields.slice(2, 5).map((field) => fieldHtml(field, values[field.name], currencyCode)).join('')}${applicationFields.slice(6).map((field) => fieldHtml(field, values[field.name], currencyCode)).join('')}</div></div></section>
       <div class="form-foot"><small>Assessment is a probability estimate. It does not automatically approve or reject a loan. Fields not present in the training data are not requested.</small><button class="button button-primary" type="submit">${edit ? 'Resubmit for review' : 'Submit application'} <span aria-hidden="true">→</span></button></div>
     </form>`;
 }
@@ -300,12 +365,13 @@ function factorRows(factors = []) {
     return `<div class="factor-row"><span>${escapeHtml(factor.label)}</span><div class="factor-track" title="One-feature-at-a-time sensitivity"><span class="${change > 0 ? 'risk-up' : ''}" style="width:${width}%"></span></div><span class="factor-value">${arrow} ${change > 0 ? '+' : ''}${(change * 100).toFixed(1)} pp</span></div>`;
   }).join('')}</div>`;
 }
-function detailFields(data) {
+function detailFields(data, currencyCode = 'USD') {
+  currencyCode = data.currency_code || currencyCode;
   const entries = [
-    ['Requested amount', money(data.loan_amount)], ['Term', `${number(data.term_months)} months`], ['Annual income', money(data.annual_income)],
+    ['Requested amount', money(data.loan_amount, currencyCode)], ['Term', `${number(data.term_months)} months`], ['Annual income', money(data.annual_income, currencyCode)],
     ['Home ownership', titleWords(data.home_ownership)], ['Employment length', data.employment_length ? titleWords(data.employment_length) : 'Not provided'], ['Loan purpose', titleWords(data.purpose)], ['Debt-to-income', `${number(data.dti, 2)}%`],
     ['FICO score', number(data.fico_score)], ['Prior delinquencies', number(data.prior_delinquencies)], ['Recent inquiries', number(data.recent_credit_inquiries)],
-    ['Open accounts', number(data.open_accounts)], ['Public records', number(data.public_records)], ['Revolving balance', money(data.revolving_balance)],
+    ['Open accounts', number(data.open_accounts)], ['Public records', number(data.public_records)], ['Revolving balance', money(data.revolving_balance, currencyCode)],
     ['Revolving utilization', `${number(data.revolving_utilization, 1)}%`], ['Total accounts', number(data.total_accounts)],
   ];
   return `<div class="detail-list">${entries.map(([label, value]) => `<div class="detail-field"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong></div>`).join('')}</div>`;
@@ -328,7 +394,7 @@ async function renderApplicationDetail(id) {
   const staff = state.user.role !== 'APPLICANT';
   const prediction = item.prediction;
   const risk = prediction?.risk_category || '';
-  const warningBlock = prediction?.range_warnings?.length ? `<div class="callout warning" style="margin-top:12px"><strong>Outside training range.</strong> ${prediction.range_warnings.map((warning) => `${escapeHtml(warning.label)} ${escapeHtml(number(warning.submitted_value, 1))} is outside ${escapeHtml(number(warning.observed_minimum, 1))}–${escapeHtml(number(warning.observed_maximum, 1))}. Treat this estimate cautiously.`).join('<br>')}</div>` : '';
+  const warningBlock = prediction?.range_warnings?.length ? `<div class="callout warning" style="margin-top:12px"><strong>Outside training range.</strong> ${prediction.range_warnings.map((warning) => `${escapeHtml(warning.label)} ${escapeHtml(monetaryFeatureValue(warning.feature, warning.submitted_value, item.currency_code))} is outside ${escapeHtml(monetaryFeatureValue(warning.feature, warning.observed_minimum, item.currency_code))}–${escapeHtml(monetaryFeatureValue(warning.feature, warning.observed_maximum, item.currency_code))}. Treat this estimate cautiously.`).join('<br>')}</div>` : '';
   const applicantResponse = !staff && item.status === 'NEEDS_MORE_INFORMATION';
   const canReassess = staff && ['AI_ASSESSED', 'UNDER_REVIEW'].includes(item.status);
   const reassessButton = canReassess ? `<button type="button" class="button button-outline" data-action="reassess" data-id="${escapeHtml(item.id)}">New assessment</button>` : '';
@@ -365,7 +431,7 @@ async function renderModel() {
   byId('model-footer').textContent = `${metadata.algorithm} · ${metadata.model_version}`;
   byId('page').innerHTML = `<div class="page-heading"><div><div class="eyebrow-sub">MODEL CARD &amp; MONITORING</div><h2>Model &amp; governance</h2><p>Metrics from the actual supplied data and the selected model artifact.</p></div>${state.user.role === 'ADMIN' ? '<button class="button button-primary" data-action="retrain">↻ Retrain from bundled dataset</button>' : ''}</div>
     <div class="callout warning" style="margin-bottom:15px"><strong>Scope limitation.</strong> ${metadata.dataset.rows_after_duplicate_id_removal} source rows, ${metadata.dataset.mature_rows_used} completed individual outcomes, ${metadata.dataset.unresolved_rows_excluded} unresolved individual loans, and ${metadata.dataset.joint_or_other_rows_excluded} joint/other applications excluded. The source has ${escapeHtml((metadata.dataset.issue_months || []).join(', ') || 'one recorded issue month')} only. Holdout metrics are illustrative for this cohort and do not establish performance on new years, lenders, or applicants; model probabilities are not calibrated for real lending.</div>
-    <div class="metrics-grid">${metricCard('Active algorithm', metadata.algorithm, '⌁', metadata.model_version)}${metricCard('Mature training records', number(metadata.dataset.mature_rows_used), '▦', `${number(outcomeCounts['Charged Off'])} charged off · ${number(outcomeCounts['Fully Paid'])} fully paid`, 'metric-blue')}${metricCard('Held-out ROC-AUC', number(metrics.roc_auc * 100,1) + '%', '↗', 'Stratified test split · random state 42')}${metricCard('Held-out PR-AUC', number(metrics.pr_auc * 100,1) + '%', '◉', 'Average precision for default class', 'metric-amber')}${metricCard('Precision', number(metrics.precision * 100,1) + '%', '✓', 'At 0.5 classification threshold')}${metricCard('Default recall', number(metrics.recall * 100,1) + '%', '!', 'At 0.5 classification threshold', 'metric-red')}${metricCard('Predictions recorded', number(result.prediction_count), '⌁', 'Immutable prediction history')}${metricCard('Features used', number(metadata.features.length), '▤', `Trained ${dateText(metadata.trained_at)}`, 'metric-blue')}</div>
+    <div class="callout warning" style="margin-bottom:15px"><strong>Financial-unit scope.</strong> ${escapeHtml(metadata.financial_units?.application_market || 'United States')} market / ${escapeHtml(metadata.financial_units?.reference_currency || 'USD')} only. The model uses raw USD monetary features and performs no currency conversion.</div><div class="metrics-grid">${metricCard('Active algorithm', metadata.algorithm, '⌁', metadata.model_version)}${metricCard('Mature training records', number(metadata.dataset.mature_rows_used), '▦', `${number(outcomeCounts['Charged Off'])} charged off · ${number(outcomeCounts['Fully Paid'])} fully paid`, 'metric-blue')}${metricCard('Held-out ROC-AUC', number(metrics.roc_auc * 100,1) + '%', '↗', 'Stratified test split · random state 42')}${metricCard('Held-out PR-AUC', number(metrics.pr_auc * 100,1) + '%', '◉', 'Average precision for default class', 'metric-amber')}${metricCard('Precision', number(metrics.precision * 100,1) + '%', '✓', 'At 0.5 classification threshold')}${metricCard('Default recall', number(metrics.recall * 100,1) + '%', '!', 'At 0.5 classification threshold', 'metric-red')}${metricCard('Predictions recorded', number(result.prediction_count), '⌁', 'Immutable prediction history')}${metricCard('Features used', number(metadata.features.length), '▤', `Trained ${dateText(metadata.trained_at)}`, 'metric-blue')}</div>
     <div class="content-grid"><section class="panel"><div class="panel-head"><div><div class="panel-title">Validation comparison</div><div class="panel-subtitle">Candidate models compared before tuning the selected candidate</div></div><span class="role-badge">Selected: ${escapeHtml(metadata.algorithm)}</span></div><div class="table-wrap"><table class="metrics-table"><thead><tr><th>Candidate</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1</th><th>ROC-AUC</th><th>PR-AUC</th></tr></thead><tbody>${comparisonRows}</tbody></table></div><div class="panel-body"><div class="field-hint">Selection rule: highest validation PR-AUC; ties use default recall, then ROC-AUC. Hyperparameters were tuned with three-fold cross-validation on the training portion. Metrics above are validation results; cards show the untouched test set.</div></div></section>
     <section class="panel"><div class="panel-head"><div><div class="panel-title">Held-out test confusion matrix</div><div class="panel-subtitle">Threshold ${metrics.classification_threshold} on the positive class</div></div></div><div class="panel-body"><table class="metrics-table"><thead><tr><th></th><th>Predicted paid</th><th>Predicted charged off</th></tr></thead><tbody><tr><td>Actual paid</td><td>${metrics.confusion_matrix.true_negative}</td><td>${metrics.confusion_matrix.false_positive}</td></tr><tr><td>Actual charged off</td><td>${metrics.confusion_matrix.false_negative}</td><td>${metrics.confusion_matrix.true_positive}</td></tr></tbody></table><div class="field-hint" style="margin-top:9px">Default probability is shown separately from this 0.5 binary threshold and from the configurable risk bands.</div></div></section></div>
     <div class="content-grid"><section class="panel"><div class="panel-head"><div><div class="panel-title">Permutation importance</div><div class="panel-subtitle">Change in held-out average precision when each feature is shuffled</div></div></div><div class="panel-body chart-bars">${importanceRows}</div></section><section class="panel"><div class="panel-head"><div><div class="panel-title">Training pipeline</div><div class="panel-subtitle">Reproducible preprocessing and model selection</div></div></div><div class="panel-body"><div class="timeline">${[['Raw cohort', `${metadata.dataset.rows_after_duplicate_id_removal} unique LendingClub records`],['Outcome filter', `${metadata.dataset.mature_rows_used} completed loans · Current and late accounts excluded`],['Preprocess', 'Median/mode imputation · one-hot categories · scaled numeric fields'],['Compare', 'Logistic regression · decision tree · random forest · SVM'],['Select & tune', 'Validation PR-AUC · 3-fold randomized search'],['Evaluate', `${metadata.split.held_out_test_rows} untouched stratified test records`]].map(([title,detail])=>`<div class="timeline-item"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small></div>`).join('')}</div></div></section></div>
@@ -455,6 +521,16 @@ document.addEventListener('submit', async (event) => {
     } else if (form.id === 'register-form') {
       const result = await api('/api/auth/register', { method: 'POST', body: JSON.stringify(formObject(form)) });
       state.user = result.user; state.page = 'dashboard'; showWorkspace();
+    } else if (form.id === 'regional-form') {
+      const choice = form.elements.namedItem('currency_choice').value;
+      const market = state.regionalOptions.supported_markets.find((entry) => choice === `${entry.currency_code} — ${entry.currency_name} — ${entry.country_name} — ${entry.currency_symbol}`);
+      const countryCode = form.elements.namedItem('country_code').value;
+      if (!market || market.country_code !== countryCode) throw new Error('Choose one of the supported country and currency combinations.');
+      const result = await api('/api/preferences/regional', { method: 'PUT', body: JSON.stringify({ country_code: countryCode, currency_code: market.currency_code, locale_code: form.elements.namedItem('locale_code').value }) });
+      state.user = result.user;
+      state.applicationSetupConfirmed = true;
+      state.page = 'new-application';
+      await renderApplicationForm();
     } else if (form.id === 'application-filter') {
       state.applicationPage = 1; await renderApplications();
     } else if (form.id === 'application-form') {
@@ -537,7 +613,10 @@ document.addEventListener('click', async (event) => {
     if (name === 'dismiss-modal') { action.closest('.modal-backdrop')?.remove(); return; }
     if (name === 'edit-application') {
       const item = await api(`/api/applications/${encodeURIComponent(action.dataset.id)}`);
-      state.applicationId = item.id; state.page = 'new-application'; setPageHeader(); renderApplicationForm(item.application_data); return;
+      state.applicationId = item.id;
+      state.applicationEditing = true;
+      state.applicationEditingValues = { ...item.application_data, country_code: item.country_code, currency_code: item.currency_code };
+      state.page = 'new-application'; setPageHeader(); renderApplicationForm(state.applicationEditingValues); return;
     }
     if (name === 'retrain') {
       confirmModal('Retrain the active model?', 'A new artifact will be trained from the bundled historical CSV. Previous prediction records will remain unchanged.', 'confirm-retrain', '', ''); return;

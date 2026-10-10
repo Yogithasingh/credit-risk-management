@@ -37,6 +37,8 @@ from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
 
+from app.regional import MODEL_FINANCIAL_SCOPE
+
 
 RANDOM_STATE = 42
 NUMERIC_FEATURES = [
@@ -324,6 +326,7 @@ def train_model(dataset_path: Path, artifact_dir: Path) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "model_version": version,
         "algorithm": selected_name,
+        "financial_units": MODEL_FINANCIAL_SCOPE,
         "selection_criterion": "Highest validation PR-AUC; ties are resolved by default recall, then ROC-AUC.",
         "tuning": {"method": "RandomizedSearchCV", "scoring": "average_precision", "best_parameters": search.best_params_, "best_cross_validation_pr_auc": round(float(search.best_score_), 4), "folds": 3},
         "trained_at": train_time,

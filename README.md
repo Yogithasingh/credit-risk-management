@@ -84,6 +84,16 @@ Only features present in the data and that an applicant can reasonably enter bef
 | Revolving utilization | `revol_util` | Numeric percentage |
 | Total accounts | `total_acc` | Numeric count |
 
+### Currency and regional settings
+
+The bundled LendingClub features `loan_amnt`, `annual_inc`, and `revol_bal` are USD-denominated raw amounts. The current model is therefore limited to the United States application market and ISO 4217 currency `USD`; INR, GBP, EUR, and other markets are shown as unsupported. No exchange-rate provider or conversion is used. A currency choice alone would not make this US-trained model valid for another country's credit system.
+
+Before entering financial values, an applicant confirms the application market and currency. The application row stores `country_code` and `currency_code`; existing rows are migrated with `US` / `USD` defaults because the previous form and PDF already treated all submitted values as USD. The migration does not change any amount. Account preferences separately store the display locale, which controls browser number and date formatting and can be changed without changing stored amounts or their currency.
+
+The browser may suggest a display locale based on its language settings. That suggestion is only for formatting and is not treated as the applicant's location. The selected market describes the loan/model context; it is not proof of residence, nationality, identity, eligibility, or identity-verification jurisdiction. The interface remains English even when a different display locale is selected.
+
+Portfolio averages are grouped by `currency_code`. Application CSV, BI CSV, API responses, reviewer screens, and PDFs carry the currency code alongside the numeric amounts. Documents, TrustCheck review, expected-loss calculations, and exchange-rate conversion are not implemented in this application.
+
 The applicant form does not ask for fields absent from the model. The sample supports only the categories above; numeric inputs outside the model's training-split range receive a warning. Employment length is optional. Users enter demonstration credit-profile values; an actual lender would use authorized, verified sources.
 
 ## Risk score and decision workflow
@@ -158,6 +168,7 @@ The local API reference at `/docs` reads endpoint definitions from FastAPI's Ope
 | Area | Endpoints |
 |---|---|
 | Health | `GET /api/health` |
+| Regional configuration | `GET /api/config/regional`, `PUT /api/preferences/regional` |
 | Authentication | `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
 | Applications | `GET/POST /api/applications`, `GET /api/applications/{id}` (includes prediction history), `POST /api/applications/{id}/predict`, `POST /api/applications/{id}/review`, `POST /api/applications/{id}/decision`, `PUT /api/applications/{id}/information` |
 | Notifications | `GET /api/notifications`, `PATCH /api/notifications/{id}/read` (signed-in user's notifications only) |

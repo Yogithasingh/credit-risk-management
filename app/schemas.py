@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.regional import SUPPORTED_LOCALES
+
 
 class RegisterInput(BaseModel):
     full_name: str = Field(min_length=2, max_length=100)
@@ -38,6 +40,9 @@ class LoginInput(BaseModel):
 class ApplicationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Defaults retain the original API contract, whose only accepted inputs were USD.
+    country_code: Literal["US"] = "US"
+    currency_code: Literal["USD"] = "USD"
     loan_amount: float = Field(gt=0, le=1_000_000)
     term_months: Literal[36, 60]
     annual_income: float = Field(gt=0, le=100_000_000)
@@ -68,6 +73,22 @@ class ApplicationInput(BaseModel):
     revolving_balance: float = Field(ge=0, le=100_000_000)
     revolving_utilization: float = Field(ge=0, le=300)
     total_accounts: int = Field(ge=0, le=1000)
+
+
+class RegionalPreferenceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    country_code: Literal["US"]
+    currency_code: Literal["USD"]
+    locale_code: str
+
+    @field_validator("locale_code")
+    @classmethod
+    def supported_locale(cls, value: str) -> str:
+        supported = {item["locale_code"] for item in SUPPORTED_LOCALES}
+        if value not in supported:
+            raise ValueError("Choose a supported display locale.")
+        return value
 
 
 class DecisionInput(BaseModel):

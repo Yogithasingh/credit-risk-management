@@ -28,11 +28,13 @@ from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from app import database
+from app import regional
 from app.schemas import (
     ApplicationInput,
     DecisionInput,
     LoginInput,
     RegisterInput,
+    RegionalPreferenceInput,
     RiskThresholdInput,
     UserActiveInput,
     UserRoleInput,
@@ -196,7 +198,7 @@ def _set_session(response: Response, user: dict[str, Any], request: Request) -> 
 
 
 def _feature_payload(payload: ApplicationInput) -> dict[str, Any]:
-    return payload.model_dump()
+    return payload.model_dump(exclude={"country_code", "currency_code"})
 
 
 def _create_prediction(
@@ -340,6 +342,34 @@ def health():
     return {"status": status, "database": db_status, "model": model_status}
 
 
+@app.get("/api/config/regional")
+def regional_configuration():
+    return regional.options_public()
+
+
+@app.put("/api/preferences/regional")
+def update_regional_preferences(
+    payload: RegionalPreferenceInput,
+    user: dict[str, Any] = Depends(_current_user),
+):
+    with database.connect() as db:
+        db.execute(
+            "UPDATE users SET country_code=?,currency_code=?,locale_code=? WHERE id=?",
+            (payload.country_code, payload.currency_code, payload.locale_code, user["id"]),
+        )
+        updated_row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        updated_user = database.user_public(updated_row)
+        database.audit(
+            db,
+            updated_user,
+            "REGIONAL_PREFERENCES_UPDATED",
+            "user",
+            user["id"],
+            {"country_code": payload.country_code, "currency_code": payload.currency_code, "locale_code": payload.locale_code},
+        )
+    return {"user": updated_user}
+
+
 @app.post("/api/auth/register", status_code=201)
 def register(payload: RegisterInput, request: Request, response: Response):
     if os.getenv("ALLOW_REGISTRATION", "true").strip().lower() not in {"true", "1", "yes"}:
@@ -348,7 +378,7 @@ def register(payload: RegisterInput, request: Request, response: Response):
     with database.connect() as db:
         try:
             db.execute(
-                "INSERT INTO users(id,full_name,email,password_hash,role,active,created_at) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO users(id,full_name,email,password_hash,role,active,created_at,locale_code) VALUES(?,?,?,?,?,?,?,NULL)",
                 (user_id, payload.full_name, payload.email, hash_password(payload.password), "APPLICANT", 1, database.utc_now()),
             )
         except Exception as exc:
@@ -465,10 +495,13 @@ def dashboard_summary(user: dict[str, Any] = Depends(_current_user)):
             """SELECT COUNT(*) AS total,
                       SUM(CASE WHEN status IN ('AI_ASSESSED','UNDER_REVIEW','NEEDS_MORE_INFORMATION') THEN 1 ELSE 0 END) AS pending,
                       SUM(CASE WHEN status='APPROVED' THEN 1 ELSE 0 END) AS approved,
-                      SUM(CASE WHEN status='REJECTED' THEN 1 ELSE 0 END) AS rejected,
-                      AVG(CAST(json_extract(application_data,'$.loan_amount') AS REAL)) AS avg_loan
+                      SUM(CASE WHEN status='REJECTED' THEN 1 ELSE 0 END) AS rejected
                FROM applications"""
         ).fetchone()
+        loan_averages = db.execute(
+            """SELECT currency_code, AVG(CAST(json_extract(application_data,'$.loan_amount') AS REAL)) AS average_loan_amount
+               FROM applications GROUP BY currency_code ORDER BY currency_code"""
+        ).fetchall()
         risks = db.execute(
             """SELECT p.risk_category,COUNT(*) AS count FROM applications a
                JOIN predictions p ON p.id=a.latest_prediction_id GROUP BY p.risk_category"""
@@ -487,7 +520,13 @@ def dashboard_summary(user: dict[str, Any] = Depends(_current_user)):
         "approved": counts["approved"] or 0,
         "rejected": counts["rejected"] or 0,
         "risk_distribution": {row["risk_category"]: row["count"] for row in risks},
-        "average_loan_amount": round(counts["avg_loan"], 2) if counts["avg_loan"] is not None else None,
+        "average_loan_amount_by_currency": [
+            {"currency_code": row["currency_code"], "average_loan_amount": round(row["average_loan_amount"], 2)}
+            for row in loan_averages
+        ],
+        # Retained for existing API consumers; null when a future portfolio has mixed currencies.
+        "average_loan_amount": round(loan_averages[0]["average_loan_amount"], 2) if len(loan_averages) == 1 else None,
+        "average_loan_currency_code": loan_averages[0]["currency_code"] if len(loan_averages) == 1 else None,
         "average_risk_score": round(average_risk, 2) if average_risk is not None else None,
         "applications_by_month": list(reversed([dict(row) for row in recent])),
         "historical_default_rate": metadata.get("dataset", {}).get("default_rate_among_matured"),
@@ -543,12 +582,12 @@ def create_application(payload: ApplicationInput, user: dict[str, Any] = Depends
     values = _feature_payload(payload)
     with database.connect() as db:
         db.execute(
-            """INSERT INTO applications(id,applicant_id,status,applicant_name,application_data,created_at,updated_at,status_updated_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (application_id, user["id"], "AI_ASSESSED", user["full_name"], json.dumps(values, separators=(",", ":")), now, now, now),
+            """INSERT INTO applications(id,applicant_id,status,applicant_name,application_data,created_at,updated_at,status_updated_at,country_code,currency_code)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (application_id, user["id"], "AI_ASSESSED", user["full_name"], json.dumps(values, separators=(",", ":")), now, now, now, payload.country_code, payload.currency_code),
         )
         _prediction_id, prediction = _create_prediction(db, application_id, values, user)
-        database.audit(db, user, "APPLICATION_SUBMITTED", "application", application_id, {"status": "AI_ASSESSED"})
+        database.audit(db, user, "APPLICATION_SUBMITTED", "application", application_id, {"status": "AI_ASSESSED", "country_code": payload.country_code, "currency_code": payload.currency_code})
         row = _get_application(db, application_id)
     result = _visible_application(row, user)
     result["prediction"] = prediction
@@ -678,6 +717,8 @@ def resubmit_information(application_id: str, payload: ApplicationInput, user: d
         _check_application_access(row, user)
         if row["status"] != "NEEDS_MORE_INFORMATION":
             raise HTTPException(status_code=409, detail="This application is not awaiting more information.")
+        if payload.country_code != row["country_code"] or payload.currency_code != row["currency_code"]:
+            raise HTTPException(status_code=409, detail="The market and currency cannot be changed while editing an existing application.")
         now = database.utc_now()
         changed = db.execute(
             "UPDATE applications SET application_data=?,status='AI_ASSESSED',analyst_id=NULL,analyst_notes='',decision=NULL,decision_at=NULL,updated_at=?,status_updated_at=? WHERE id=? AND status='NEEDS_MORE_INFORMATION'",
@@ -696,7 +737,7 @@ def resubmit_information(application_id: str, payload: ApplicationInput, user: d
 @app.get("/api/models/active")
 def active_model(user: dict[str, Any] = Depends(_current_user)):
     _staff(user)
-    metadata = model_service.info()
+    metadata = {**model_service.info(), "financial_units": regional.MODEL_FINANCIAL_SCOPE}
     with database.connect() as db:
         predictions = db.execute("SELECT COUNT(*) AS n FROM predictions").fetchone()["n"]
         versions = [
@@ -818,13 +859,13 @@ def report_applications(user: dict[str, Any] = Depends(_current_user)):
         database.audit(db, user, "REPORT_EXPORTED", "report", "applications_csv", {"records": len(rows)})
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["application_id", "application_date", "applicant_name", "applicant_email", "loan_amount", "loan_term_months", "annual_income", "purpose", "status", "probability_of_default", "risk_score", "risk_category", "low_risk_maximum", "medium_risk_maximum", "model_version", "analyst_decision", "analyst_notes", "decision_at"])
+    writer.writerow(["application_id", "application_date", "applicant_name", "applicant_email", "country_code", "currency_code", "loan_amount", "loan_term_months", "annual_income", "purpose", "status", "probability_of_default", "risk_score", "risk_category", "low_risk_maximum", "medium_risk_maximum", "model_version", "analyst_decision", "analyst_notes", "decision_at"])
     for row in rows:
         app_data = json.loads(row["application_data"])
         item = database.application_public(row)
         prediction = item["prediction"] or {}
         risk_thresholds = prediction.get("thresholds") or {}
-        writer.writerow([_csv_cell(item["id"]), item["created_at"], _csv_cell(item["applicant_name"]), _csv_cell(item["applicant_email"]), app_data.get("loan_amount"), app_data.get("term_months"), app_data.get("annual_income"), app_data.get("purpose"), item["status"], prediction.get("probability_of_default"), prediction.get("risk_score"), prediction.get("risk_category"), risk_thresholds.get("low_risk_maximum"), risk_thresholds.get("medium_risk_maximum"), prediction.get("model_version"), item["decision"], _csv_cell(item["analyst_notes"]), item["decision_at"]])
+        writer.writerow([_csv_cell(item["id"]), item["created_at"], _csv_cell(item["applicant_name"]), _csv_cell(item["applicant_email"]), item["country_code"], item["currency_code"], app_data.get("loan_amount"), app_data.get("term_months"), app_data.get("annual_income"), app_data.get("purpose"), item["status"], prediction.get("probability_of_default"), prediction.get("risk_score"), prediction.get("risk_category"), risk_thresholds.get("low_risk_maximum"), risk_thresholds.get("medium_risk_maximum"), prediction.get("model_version"), item["decision"], _csv_cell(item["analyst_notes"]), item["decision_at"]])
     output.seek(0)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=creditguard-applications.csv"})
 
@@ -839,6 +880,7 @@ def report_application_pdf(application_id: str, user: dict[str, Any] = Depends(_
         item = _visible_application(row, user)
         database.audit(db, user, "REPORT_EXPORTED", "application", application_id, {"format": "pdf"})
     data = item["application_data"]
+    currency_code = item["currency_code"]
     prediction = item["prediction"] or {}
     output = io.BytesIO()
     styles = getSampleStyleSheet()
@@ -862,6 +904,7 @@ def report_application_pdf(application_id: str, user: dict[str, Any] = Depends(_
     summary_data = [
         [paragraph("Application ID", "CellMuted"), paragraph(item["id"]), paragraph("Status", "CellMuted"), paragraph(item["status"].replace("_", " "))],
         [paragraph("Applicant", "CellMuted"), paragraph(item["applicant_name"]), paragraph("Submitted", "CellMuted"), paragraph(item["created_at"])],
+        [paragraph("Application market", "CellMuted"), paragraph(item["country_code"]), paragraph("Currency", "CellMuted"), paragraph(currency_code)],
         [paragraph("Analyst decision", "CellMuted"), paragraph(item["decision"]), paragraph("Decision time", "CellMuted"), paragraph(item["decision_at"])],
     ]
     if user["role"] in {"ANALYST", "ADMIN"}:
@@ -875,13 +918,13 @@ def report_application_pdf(application_id: str, user: dict[str, Any] = Depends(_
     ]))
     story.extend([summary_table, Paragraph("Applicant and financial profile", styles["SectionHeading"])])
     field_rows = [
-        ("Requested loan amount", f"${float(data.get('loan_amount', 0)):,.2f}"), ("Term", f"{data.get('term_months', '—')} months"),
-        ("Annual income", f"${float(data.get('annual_income', 0)):,.2f}"), ("Purpose", data.get("purpose")),
+        ("Requested loan amount", f"{currency_code} {float(data.get('loan_amount', 0)):,.2f}"), ("Term", f"{data.get('term_months', '—')} months"),
+        ("Annual income", f"{currency_code} {float(data.get('annual_income', 0)):,.2f}"), ("Purpose", data.get("purpose")),
         ("Home ownership", data.get("home_ownership")), ("Employment length", data.get("employment_length") or "Not provided"),
         ("Debt-to-income", f"{data.get('dti', '—')}%"), ("FICO score", data.get("fico_score")),
         ("Prior delinquencies", data.get("prior_delinquencies")), ("Recent inquiries", data.get("recent_credit_inquiries")),
         ("Open accounts", data.get("open_accounts")), ("Public records", data.get("public_records")),
-        ("Revolving balance", f"${float(data.get('revolving_balance', 0)):,.2f}"), ("Revolving utilization", f"{data.get('revolving_utilization', '—')}%"),
+        ("Revolving balance", f"{currency_code} {float(data.get('revolving_balance', 0)):,.2f}"), ("Revolving utilization", f"{data.get('revolving_utilization', '—')}%"),
         ("Total accounts", data.get("total_accounts")),
     ]
     field_data = []
@@ -901,7 +944,10 @@ def report_application_pdf(application_id: str, user: dict[str, Any] = Depends(_
         factor_rows = [[paragraph("Feature", "CellMuted"), paragraph("Submitted value", "CellMuted"), paragraph("Sensitivity vs. reference", "CellMuted")]]
         for factor in prediction["factors"]:
             delta = factor["probability_change"] * 100
-            factor_rows.append([paragraph(factor["label"]), paragraph(factor.get("value")), paragraph(f"{delta:+.1f} percentage points" if abs(delta) >= 0.05 else "Little change")])
+            submitted_value = factor.get("value")
+            if factor.get("feature") in regional.MODEL_FINANCIAL_SCOPE["monetary_features"] and submitted_value is not None:
+                submitted_value = f"{currency_code} {float(submitted_value):,.2f}"
+            factor_rows.append([paragraph(factor["label"]), paragraph(submitted_value), paragraph(f"{delta:+.1f} percentage points" if abs(delta) >= 0.05 else "Little change")])
         factor_table = Table(factor_rows, colWidths=[2.3 * inch, 1.8 * inch, 2.4 * inch], hAlign="LEFT")
         factor_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f6f8fa")), ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#e5ebef")), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7), ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
         story.extend([factor_table, Spacer(1, 7), Paragraph(html.escape(model_service.info()["explanation_method"]), styles["CellMuted"])])
@@ -925,12 +971,12 @@ def report_powerbi(user: dict[str, Any] = Depends(_current_user)):
         database.audit(db, user, "REPORT_EXPORTED", "report", "powerbi_csv", {"records": len(rows)})
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["application_id", "application_date", "loan_amount", "loan_term_months", "annual_income", "purpose", "debt_to_income_ratio", "fico_score", "prior_delinquencies", "probability_of_default", "risk_score", "risk_category", "low_risk_maximum", "medium_risk_maximum", "application_status", "final_decision", "actual_default_status", "model_version"])
+    writer.writerow(["application_id", "application_date", "country_code", "currency_code", "loan_amount", "loan_term_months", "annual_income", "purpose", "debt_to_income_ratio", "fico_score", "prior_delinquencies", "probability_of_default", "risk_score", "risk_category", "low_risk_maximum", "medium_risk_maximum", "application_status", "final_decision", "actual_default_status", "model_version"])
     for row in rows:
         item = database.application_public(row)
         data = item["application_data"]
         prediction = item["prediction"] or {}
         risk_thresholds = prediction.get("thresholds") or {}
-        writer.writerow([item["id"], item["created_at"], data.get("loan_amount"), data.get("term_months"), data.get("annual_income"), data.get("purpose"), data.get("dti"), data.get("fico_score"), data.get("prior_delinquencies"), prediction.get("probability_of_default"), prediction.get("risk_score"), prediction.get("risk_category"), risk_thresholds.get("low_risk_maximum"), risk_thresholds.get("medium_risk_maximum"), item["status"], item["decision"], "NOT_OBSERVED", prediction.get("model_version")])
+        writer.writerow([item["id"], item["created_at"], item["country_code"], item["currency_code"], data.get("loan_amount"), data.get("term_months"), data.get("annual_income"), data.get("purpose"), data.get("dti"), data.get("fico_score"), data.get("prior_delinquencies"), prediction.get("probability_of_default"), prediction.get("risk_score"), prediction.get("risk_category"), risk_thresholds.get("low_risk_maximum"), risk_thresholds.get("medium_risk_maximum"), item["status"], item["decision"], "NOT_OBSERVED", prediction.get("model_version")])
     output.seek(0)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=creditguard-powerbi.csv"})
